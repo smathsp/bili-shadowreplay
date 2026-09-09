@@ -457,12 +457,15 @@ impl BsrTool {
             }
             "analyze_danmu_highlights" => {
                 use recorder::platforms::PlatformType;
+                use std::collections::BTreeMap;
                 use std::str::FromStr;
                 let platform = PlatformType::from_str(&Self::string_arg(args, "platform")?)
                     .map_err(|e| BsrToolError(e.to_string()))?;
                 let window = Self::f64_arg(args, "time_window")?;
-                if window <= 0.0 {
-                    return Err(BsrToolError("time_window must be positive".into()));
+                if !window.is_finite() || window < 0.001 {
+                    return Err(BsrToolError(
+                        "time_window must be at least 0.001 seconds".into(),
+                    ));
                 }
                 let minimum = Self::i64_arg(args, "min_density")?;
                 let minimum = usize::try_from(minimum).map_err(|_| {
@@ -470,20 +473,22 @@ impl BsrTool {
                 })?;
                 let rows = self
                     .recorder_manager
-                    .load_danmus(
+                    .load_relative_danmus(
                         platform,
                         &Self::string_arg(args, "room_id")?,
                         &Self::string_arg(args, "live_id")?,
                     )
                     .await
                     .map_err(|e| BsrToolError(e.to_string()))?;
-                let max_ts = rows.iter().map(|row| row.ts).max().unwrap_or(0) as f64 / 1000.0;
-                let highlights = (0..(max_ts / window).ceil() as usize).filter_map(|index| {
+                let mut windows = BTreeMap::<usize, Vec<_>>::new();
+                for row in &rows {
+                    let index = ((row.ts as f64 / 1000.0) / window).floor() as usize;
+                    windows.entry(index).or_default().push(row);
+                }
+                let highlights = windows.into_iter().filter_map(|(index, comments)| {
                     let start = index as f64 * window;
-                    let end = ((index + 1) as f64 * window).min(max_ts);
-                    let comments = rows.iter().filter(|row| (row.ts as f64 / 1000.0) >= start && (row.ts as f64 / 1000.0) < end).collect::<Vec<_>>();
                     (comments.len() >= minimum).then(|| json!({
-                        "start_time": start, "end_time": end, "comment_count": comments.len(),
+                        "start_time": start, "end_time": start + window, "comment_count": comments.len(),
                         "density": comments.len() as f64 / window,
                         "sample_comments": comments.iter().take(5).map(|row| row.content.clone()).collect::<Vec<_>>()
                     }))
@@ -501,11 +506,23 @@ impl BsrTool {
                     .ok_or_else(|| BsrToolError("Missing keywords".into()))?
                     .iter()
                     .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|keyword| !keyword.is_empty())
                     .collect::<Vec<_>>();
+                if keywords.is_empty() {
+                    return Err(BsrToolError(
+                        "keywords must contain at least one non-empty value".into(),
+                    ));
+                }
                 let context = Self::f64_arg(args, "context_seconds")?;
+                if !context.is_finite() || context < 0.0 {
+                    return Err(BsrToolError(
+                        "context_seconds must be a non-negative finite number".into(),
+                    ));
+                }
                 let rows = self
                     .recorder_manager
-                    .load_danmus(
+                    .load_relative_danmus(
                         platform,
                         &Self::string_arg(args, "room_id")?,
                         &Self::string_arg(args, "live_id")?,
@@ -514,7 +531,7 @@ impl BsrTool {
                     .map_err(|e| BsrToolError(e.to_string()))?;
                 let matches = rows.iter().flat_map(|row| keywords.iter().filter(move |keyword| row.content.contains(**keyword)).take(1).map(move |keyword| {
                     let timestamp = row.ts as f64 / 1000.0;
-                    json!({ "timestamp": timestamp, "content": row.content, "keyword": keyword, "context_start": (timestamp - context).max(0.0), "context_end": timestamp + context })
+                    json!({ "timestamp": timestamp, "content": row.content, "keyword": keyword, "context_start": (timestamp - context).max(0.0), "context_end": (timestamp + context).min(f64::MAX) })
                 })).collect::<Vec<_>>();
                 Ok(json!({ "matches": matches }))
             }

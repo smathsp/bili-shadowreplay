@@ -22,7 +22,7 @@ use tokio_tungstenite::{
     connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
 };
 
-use crate::{provider::DanmuProvider, DanmuMessage, DanmuMessageType, DanmuStreamError, LiveEvent};
+use crate::{provider::DanmuProvider, DanmuMessageType, DanmuStreamError, LiveEvent};
 use serde_json::json;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -327,21 +327,19 @@ async fn handle_binary_message(
                             err: format!("Failed to decode chat message: {}", e),
                         }
                     })?;
-                if let Some(user) = chat_msg.user {
-                    let danmu_msg = DanmuMessage {
-                        room_id: room_id.to_string(),
-                        user_id: user.id,
-                        user_name: user.nick_name,
-                        message: chat_msg.content,
-                        color: 0xffffff,
-                        timestamp: chat_msg.event_time as i64 * 1000,
-                    };
-                    debug!("Received danmu message: {:?}", danmu_msg);
-                    tx.send(DanmuMessageType::DanmuMessage(danmu_msg))
-                        .map_err(|e| DanmuStreamError::WebsocketError {
-                            err: format!("Failed to send message to channel: {}", e),
-                        })?;
-                }
+                let event = douyin_chat_event(
+                    room_id,
+                    &message.method,
+                    message.msg_id,
+                    &message.payload,
+                    chat_msg,
+                );
+                debug!("Received danmu event: {:?}", event);
+                tx.send(DanmuMessageType::Event(event)).map_err(|e| {
+                    DanmuStreamError::WebsocketError {
+                        err: format!("Failed to send message to channel: {}", e),
+                    }
+                })?;
             }
             "WebcastGiftMessage" => {
                 let gift_msg = GiftMessage::decode(message.payload.as_slice()).map_err(|e| {
@@ -451,6 +449,213 @@ async fn handle_binary_message(
     }
 
     Ok(ack)
+}
+
+fn douyin_timestamp_millis(event_time: u64) -> i64 {
+    let timestamp = if event_time == 0 {
+        chrono::Utc::now().timestamp_millis() as u64
+    } else if event_time < 10_000_000_000 {
+        event_time.saturating_mul(1000)
+    } else {
+        event_time
+    };
+    i64::try_from(timestamp).unwrap_or(i64::MAX)
+}
+
+fn douyin_avatar_url(user: &User) -> Option<String> {
+    [
+        user.avatar_thumb.as_ref(),
+        user.avatar_medium.as_ref(),
+        user.avatar_large.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|image| image.url_list_list.iter())
+    .find(|url| !url.is_empty())
+    .cloned()
+}
+
+fn douyin_fans_clubs(user: &User) -> Vec<(i64, i32)> {
+    let Some(fans_club) = &user.fans_club else {
+        return Vec::new();
+    };
+    let mut clubs = Vec::new();
+    if let Some(data) = &fans_club.data {
+        if data.anchor_id != 0 {
+            clubs.push((data.anchor_id, data.level));
+        }
+    }
+    let mut preferred = fans_club
+        .prefer_data
+        .values()
+        .filter(|data| data.anchor_id != 0)
+        .map(|data| (data.anchor_id, data.level))
+        .collect::<Vec<_>>();
+    preferred.sort_unstable();
+    for club in preferred {
+        if !clubs.contains(&club) {
+            clubs.push(club);
+        }
+    }
+    clubs
+}
+
+fn douyin_chat_event(
+    room_id: &str,
+    method: &str,
+    envelope_message_id: i64,
+    payload: &[u8],
+    chat_msg: DouyinChatMessage,
+) -> LiveEvent {
+    let timestamp_source = if chat_msg.event_time != 0 {
+        chat_msg.event_time
+    } else {
+        chat_msg
+            .common
+            .as_ref()
+            .map(|common| common.create_time)
+            .unwrap_or_default()
+    };
+    let timestamp = douyin_timestamp_millis(timestamp_source);
+    let message_id = chat_msg
+        .common
+        .as_ref()
+        .map(|common| common.msg_id)
+        .filter(|id| *id != 0)
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| envelope_message_id.to_string());
+    let user = chat_msg.user.unwrap_or_default();
+    let user_id = if !user.sec_uid.is_empty() {
+        user.sec_uid.clone()
+    } else if !user.id_str.is_empty() {
+        user.id_str.clone()
+    } else {
+        user.id.to_string()
+    };
+    let fans_clubs = douyin_fans_clubs(&user);
+    let current_target_anchor_id = fans_clubs
+        .first()
+        .map(|(anchor_id, _)| anchor_id.to_string());
+    let fans_club = fans_clubs
+        .iter()
+        .map(|(anchor_id, level)| {
+            json!({
+                "anchorId": anchor_id.to_string(),
+                "level": level,
+            })
+        })
+        .collect::<Vec<_>>();
+    let user_data = json!({
+        "id": user_id,
+        "numericId": user.id.to_string(),
+        "shortId": user.short_id.to_string(),
+        "displayId": user.display_id,
+        "name": user.nick_name,
+        "gender": user.gender,
+        "avatar": douyin_avatar_url(&user),
+        "currentTargetAnchorId": current_target_anchor_id,
+        "fansClub": fans_club,
+    });
+    let content = chat_msg.content;
+    let raw = json!({
+        "id": message_id,
+        "method": method,
+        "user": user_data,
+        "content": content,
+        "time": timestamp,
+        "payloadHex": hex::encode(payload),
+    });
+
+    LiveEvent {
+        ts: timestamp,
+        platform: "douyin".to_string(),
+        room_id: room_id.to_string(),
+        event_type: "danmu".to_string(),
+        data: json!({
+            "id": raw["id"],
+            "method": raw["method"],
+            "user": raw["user"],
+            "user_id": raw["user"]["id"],
+            "user_name": raw["user"]["name"],
+            "content": raw["content"],
+            "color": 0xffffff,
+        }),
+        raw,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creates_complete_chat_event() {
+        let chat = DouyinChatMessage {
+            common: Some(Common {
+                msg_id: 7_683_131_321_120_630_299,
+                ..Default::default()
+            }),
+            user: Some(User {
+                id: 2_988_955_578,
+                short_id: 2_988_955_578,
+                nick_name: "枯枝邀明月".to_string(),
+                gender: 1,
+                display_id: "dyr8cty6m73n".to_string(),
+                sec_uid: "MS4w.test".to_string(),
+                avatar_thumb: Some(Image {
+                    url_list_list: vec!["https://example.com/avatar.jpeg".to_string()],
+                    ..Default::default()
+                }),
+                fans_club: Some(FansClub {
+                    data: Some(FansClubData {
+                        level: 9,
+                        anchor_id: 105_460_512_869,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            content: "终于能播了".to_string(),
+            event_time: 1_788_868_414_771,
+            ..Default::default()
+        };
+
+        let event = douyin_chat_event("123", "WebcastChatMessage", 0, &[1, 2], chat);
+        assert_eq!(event.ts, 1_788_868_414_771);
+        assert_eq!(event.data["content"], "终于能播了");
+        assert_eq!(event.raw["id"], "7683131321120630299");
+        assert_eq!(event.raw["method"], "WebcastChatMessage");
+        assert_eq!(event.raw["user"]["id"], "MS4w.test");
+        assert_eq!(event.raw["user"]["shortId"], "2988955578");
+        assert_eq!(event.raw["user"]["fansClub"][0]["level"], 9);
+        assert_eq!(event.raw["user"]["currentTargetAnchorId"], "105460512869");
+        assert_eq!(event.raw["payloadHex"], "0102");
+    }
+
+    #[test]
+    fn converts_second_timestamps_to_milliseconds() {
+        assert_eq!(douyin_timestamp_millis(1_788_868_414), 1_788_868_414_000);
+    }
+
+    #[test]
+    fn falls_back_to_common_create_time() {
+        let event = douyin_chat_event(
+            "123",
+            "WebcastChatMessage",
+            1,
+            &[],
+            DouyinChatMessage {
+                common: Some(Common {
+                    create_time: 1_788_868_414,
+                    ..Default::default()
+                }),
+                content: "test".to_string(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(event.ts, 1_788_868_414_000);
+    }
 }
 
 #[async_trait]

@@ -8,7 +8,6 @@ pub mod summary;
 pub mod task;
 pub mod utils;
 pub mod video;
-#[cfg(feature = "gui")]
 pub mod video_editing;
 
 use crate::database::account::AccountRow;

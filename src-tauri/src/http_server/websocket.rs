@@ -20,6 +20,7 @@ pub async fn create_websocket_server(state: State) -> SocketIoLayer {
 
         // Subscribe to progress events
         let mut rx = state.progress_manager.subscribe();
+        let config = state.config.clone();
 
         // Spawn a task to handle progress events for this socket
         let socket_clone = socket.clone();
@@ -53,6 +54,45 @@ pub async fn create_websocket_server(state: State) -> SocketIoLayer {
                                         "room": room,
                                         "ts": ts,
                                         "content": content
+                                }),
+                            ),
+                            RecorderEvent::LiveStart { recorder } => {
+                                if !config.read().await.live_start_notify {
+                                    continue;
+                                }
+                                (
+                                    "notification",
+                                    json!({
+                                        "title": "BiliShadowReplay - 直播开始",
+                                        "body": format!(
+                                            "{} 开启了直播：{}",
+                                            recorder.user_info.user_name,
+                                            recorder.room_info.room_title
+                                        )
+                                    }),
+                                )
+                            }
+                            RecorderEvent::LiveEnd { recorder, .. } => {
+                                if !config.read().await.live_end_notify {
+                                    continue;
+                                }
+                                (
+                                    "notification",
+                                    json!({
+                                        "title": "BiliShadowReplay - 直播结束",
+                                        "body": format!(
+                                            "{} 结束了直播：{}",
+                                            recorder.user_info.user_name,
+                                            recorder.room_info.room_title
+                                        )
+                                    }),
+                                )
+                            }
+                            RecorderEvent::UserNotification { title, body } => (
+                                "notification",
+                                json!({
+                                    "title": title,
+                                    "body": body
                                 }),
                             ),
                             _ => continue,

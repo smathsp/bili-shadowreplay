@@ -526,11 +526,24 @@ async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Err
     use progress::progress_manager::ProgressManager;
     use progress::progress_reporter::EventEmitter;
 
-    setup_logging(Path::new("./")).await?;
+    let data_path = std::env::var_os("DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&args.db));
+    std::fs::create_dir_all(&data_path)?;
+    let log_path = std::env::var_os("LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_path.join("logs"));
+    setup_logging(&log_path).await?;
     log::info!("Setting up server state...");
-    let config_path = PathBuf::from(&args.config);
-    let cache_path = PathBuf::from("./cache");
-    let output_path = PathBuf::from("./output");
+    let config_path = std::env::var_os("CONFIG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&args.config));
+    let cache_path = std::env::var_os("CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./cache"));
+    let output_path = std::env::var_os("OUTPUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./output"));
     let resource_dir = if cfg!(debug_assertions) {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     } else {
@@ -539,23 +552,22 @@ async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Err
             .ok_or("Headless executable has no parent directory")?
             .to_path_buf()
     };
-    let config = match Config::load(&config_path, &cache_path, &output_path) {
+    let mut config = match Config::load(&config_path, &cache_path, &output_path) {
         Ok(config) => config,
         Err(e) => {
             log::error!("Failed to load config: {e}");
             return Err(e.into());
         }
     };
+    if let Some(whisper_model) = std::env::var_os("WHISPER_MODEL") {
+        config.whisper_model = PathBuf::from(whisper_model).to_string_lossy().to_string();
+    }
     let config = Arc::new(RwLock::new(config));
     let db = Arc::new(Database::new());
     // connect to sqlite database
 
-    let conn_url = format!("sqlite:{}/data_v2.db", args.db);
+    let conn_url = format!("sqlite:{}/data_v2.db", data_path.display());
     // create db folder if not exists
-    if !Path::new(&args.db).exists() {
-        std::fs::create_dir_all(&args.db)?;
-    }
-
     if !Sqlite::database_exists(&conn_url).await.unwrap_or(false) {
         Sqlite::create_database(&conn_url).await?;
     }
@@ -604,6 +616,7 @@ async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Err
         task_manager,
         progress_manager,
         resource_dir,
+        log_dir: log_path,
         readonly: args.readonly,
     })
 }

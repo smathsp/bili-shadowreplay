@@ -20,9 +20,10 @@ use crate::{
             add_account, get_account_count, get_accounts, get_qr, get_qr_status, remove_account,
         },
         config::{
-            get_config, get_llm_config, get_static_port, list_llm_models, update_auto_generate,
-            update_clip_name_format, update_danmu_ass_options, update_llm_config, update_notify,
-            update_openai_api_endpoint, update_openai_api_key, update_status_check_interval,
+            get_config, get_llm_config, get_static_port, list_llm_models, set_cache_path,
+            set_output_path, update_auto_generate, update_clip_name_format,
+            update_danmu_ass_options, update_llm_config, update_notify, update_openai_api_endpoint,
+            update_openai_api_key, update_powerlive_key, update_status_check_interval,
             update_subtitle_generator_type, update_subtitle_setting, update_webhook_url,
             update_whisper_language, update_whisper_model, update_whisper_prompt,
         },
@@ -47,6 +48,11 @@ use crate::{
             get_video_cover, get_video_subtitle, get_video_typelist, get_videos,
             import_external_video, update_video_cover, update_video_note, update_video_subtitle,
             upload_procedure,
+        },
+        video_editing::{
+            analyze_danmu_highlights, extract_video_audio, extract_video_frames,
+            get_archive_metadata, get_video_metadata, merge_videos, search_danmu_keywords,
+            DanmuHighlight, DanmuKeywordMatch, VideoFrame, VideoMetadata,
         },
         AccountInfo,
     },
@@ -391,6 +397,50 @@ async fn handler_update_whisper_prompt(
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct UpdatePowerliveKeyRequest {
+    powerlive_key: String,
+}
+
+async fn handler_update_powerlive_key(
+    state: axum::extract::State<State>,
+    Json(request): Json<UpdatePowerliveKeyRequest>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    update_powerlive_key(state.0, request.powerlive_key)
+        .await
+        .map_err(|_| ApiError::from("Failed to update PowerLive key"))?;
+    Ok(Json(ApiResponse::success(())))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetCachePathRequest {
+    cache_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetOutputPathRequest {
+    output_path: String,
+}
+
+async fn handler_set_cache_path(
+    state: axum::extract::State<State>,
+    Json(request): Json<SetCachePathRequest>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    set_cache_path(state.0, request.cache_path).await?;
+    Ok(Json(ApiResponse::success(())))
+}
+
+async fn handler_set_output_path(
+    state: axum::extract::State<State>,
+    Json(request): Json<SetOutputPathRequest>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    set_output_path(state.0, request.output_path).await?;
+    Ok(Json(ApiResponse::success(())))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct UpdateWebhookUrlRequest {
     webhook_url: String,
 }
@@ -456,7 +506,7 @@ async fn handler_update_openai_api_key(
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateAutoGenerateRequest {
-    enable: bool,
+    enabled: bool,
     encode_danmu: bool,
 }
 
@@ -464,7 +514,7 @@ async fn handler_update_auto_generate(
     state: axum::extract::State<State>,
     Json(auto_generate): Json<UpdateAutoGenerateRequest>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    update_auto_generate(state.0, auto_generate.enable, auto_generate.encode_danmu)
+    update_auto_generate(state.0, auto_generate.enabled, auto_generate.encode_danmu)
         .await
         .map_err(|_| ApiError::from("Failed to update auto generate setting"))?;
     Ok(Json(ApiResponse::success(())))
@@ -893,6 +943,166 @@ async fn handler_generate_audio_sample(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     generate_audio_sample(state.0, param.video_id).await?;
     Ok(Json(ApiResponse::success(())))
+}
+
+fn default_max_frames() -> usize {
+    10
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtractVideoFramesRequest {
+    video_id: i64,
+    #[serde(default)]
+    timestamps: Vec<f64>,
+    #[serde(default = "default_max_frames")]
+    max_frames: usize,
+}
+
+async fn handler_extract_video_frames(
+    state: axum::extract::State<State>,
+    Json(request): Json<ExtractVideoFramesRequest>,
+) -> Result<Json<ApiResponse<Vec<VideoFrame>>>, ApiError> {
+    if request
+        .timestamps
+        .iter()
+        .any(|timestamp| !timestamp.is_finite() || *timestamp < 0.0)
+    {
+        return Err(ApiError::from(
+            "timestamps must contain only non-negative finite numbers",
+        ));
+    }
+    let frames = extract_video_frames(
+        state.0,
+        request.video_id,
+        request.timestamps,
+        request.max_frames.clamp(1, 10),
+    )
+    .await?;
+    Ok(Json(ApiResponse::success(frames)))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoIdRequest {
+    video_id: i64,
+}
+
+async fn handler_get_video_metadata(
+    state: axum::extract::State<State>,
+    Json(request): Json<VideoIdRequest>,
+) -> Result<Json<ApiResponse<VideoMetadata>>, ApiError> {
+    let metadata = get_video_metadata(state.0, request.video_id).await?;
+    Ok(Json(ApiResponse::success(metadata)))
+}
+
+async fn handler_extract_video_audio(
+    state: axum::extract::State<State>,
+    Json(request): Json<VideoIdRequest>,
+) -> Result<Json<ApiResponse<String>>, ApiError> {
+    let path = extract_video_audio(state.0, request.video_id).await?;
+    Ok(Json(ApiResponse::success(path)))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DanmuHighlightsRequest {
+    platform: String,
+    room_id: String,
+    live_id: String,
+    time_window: f64,
+    min_density: usize,
+}
+
+async fn handler_analyze_danmu_highlights(
+    state: axum::extract::State<State>,
+    Json(request): Json<DanmuHighlightsRequest>,
+) -> Result<Json<ApiResponse<Vec<DanmuHighlight>>>, ApiError> {
+    if !request.time_window.is_finite() || request.time_window < 0.001 {
+        return Err(ApiError::from("timeWindow must be at least 0.001 seconds"));
+    }
+    let highlights = analyze_danmu_highlights(
+        state.0,
+        request.platform,
+        request.room_id,
+        request.live_id,
+        request.time_window,
+        request.min_density,
+    )
+    .await?;
+    Ok(Json(ApiResponse::success(highlights)))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchDanmuKeywordsRequest {
+    platform: String,
+    room_id: String,
+    live_id: String,
+    keywords: Vec<String>,
+    context_seconds: f64,
+}
+
+async fn handler_search_danmu_keywords(
+    state: axum::extract::State<State>,
+    Json(request): Json<SearchDanmuKeywordsRequest>,
+) -> Result<Json<ApiResponse<Vec<DanmuKeywordMatch>>>, ApiError> {
+    if !request.context_seconds.is_finite() || request.context_seconds < 0.0 {
+        return Err(ApiError::from(
+            "contextSeconds must be a non-negative number",
+        ));
+    }
+    let matches = search_danmu_keywords(
+        state.0,
+        request.platform,
+        request.room_id,
+        request.live_id,
+        request.keywords,
+        request.context_seconds,
+    )
+    .await?;
+    Ok(Json(ApiResponse::success(matches)))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeVideosRequest {
+    video_ids: Vec<i64>,
+    output_title: String,
+    output_note: String,
+    transition: Option<String>,
+}
+
+async fn handler_merge_videos(
+    state: axum::extract::State<State>,
+    Json(request): Json<MergeVideosRequest>,
+) -> Result<Json<ApiResponse<i64>>, ApiError> {
+    let video_id = merge_videos(
+        state.0,
+        request.video_ids,
+        request.output_title,
+        request.output_note,
+        request.transition,
+    )
+    .await?;
+    Ok(Json(ApiResponse::success(video_id)))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveMetadataRequest {
+    platform: String,
+    room_id: String,
+    live_id: String,
+}
+
+async fn handler_get_archive_metadata(
+    state: axum::extract::State<State>,
+    Json(request): Json<ArchiveMetadataRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let metadata =
+        get_archive_metadata(state.0, request.platform, request.room_id, request.live_id).await?;
+    Ok(Json(ApiResponse::success(metadata)))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1509,6 +1719,16 @@ async fn handler_console_log(
     Ok(Json(ApiResponse::success(())))
 }
 
+async fn handler_get_logs(
+    state: axum::extract::State<State>,
+) -> Result<Json<ApiResponse<String>>, ApiError> {
+    let log_path = state.log_dir.join("bsr.log");
+    let logs = tokio::fs::read_to_string(&log_path)
+        .await
+        .map_err(|error| ApiError(format!("Failed to read {}: {error}", log_path.display())))?;
+    Ok(Json(ApiResponse::success(logs)))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HttpProxyRequest {
@@ -1837,6 +2057,8 @@ pub async fn start_api_server(state: State) {
                 "/api/update_subtitle_setting",
                 post(handler_update_subtitle_setting),
             )
+            .route("/api/set_cache_path", post(handler_set_cache_path))
+            .route("/api/set_output_path", post(handler_set_output_path))
             .route(
                 "/api/update_clip_name_format",
                 post(handler_update_clip_name_format),
@@ -1895,6 +2117,10 @@ pub async fn start_api_server(state: State) {
                 post(handler_update_subtitle_generator_type),
             )
             .route(
+                "/api/update_powerlive_key",
+                post(handler_update_powerlive_key),
+            )
+            .route(
                 "/api/update_openai_api_endpoint",
                 post(handler_update_openai_api_endpoint),
             )
@@ -1927,6 +2153,11 @@ pub async fn start_api_server(state: State) {
             .route(
                 "/api/batch_import_external_videos",
                 post(handler_batch_import_external_videos),
+            )
+            .route("/api/merge_videos", post(handler_merge_videos))
+            .route(
+                "/api/extract_video_audio",
+                post(handler_extract_video_audio),
             )
             .route(
                 "/api/get_import_progress",
@@ -1990,6 +2221,23 @@ pub async fn start_api_server(state: State) {
             "/api/generate_audio_sample",
             post(handler_generate_audio_sample),
         )
+        .route(
+            "/api/extract_video_frames",
+            post(handler_extract_video_frames),
+        )
+        .route("/api/get_video_metadata", post(handler_get_video_metadata))
+        .route(
+            "/api/analyze_danmu_highlights",
+            post(handler_analyze_danmu_highlights),
+        )
+        .route(
+            "/api/search_danmu_keywords",
+            post(handler_search_danmu_keywords),
+        )
+        .route(
+            "/api/get_archive_metadata",
+            post(handler_get_archive_metadata),
+        )
         .route("/api/get_videos", post(handler_get_videos))
         .route("/api/get_video_cover", post(handler_get_video_cover))
         .route("/api/get_all_videos", post(handler_get_all_videos))
@@ -2001,6 +2249,7 @@ pub async fn start_api_server(state: State) {
         .route("/api/export_danmu", post(handler_export_danmu))
         // Utils commands
         .route("/api/get_disk_info", post(handler_get_disk_info))
+        .route("/api/get_logs", post(handler_get_logs))
         .route("/api/console_log", post(handler_console_log))
         .route("/api/list_folder", post(handler_list_folder))
         .route("/api/fetch", post(handler_fetch))
@@ -2034,5 +2283,21 @@ pub async fn start_api_server(state: State) {
 
     if let Err(e) = axum::serve(listener, router).await {
         log::error!("Server error: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_generate_request_uses_frontend_field_names() {
+        let request: UpdateAutoGenerateRequest = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "encodeDanmu": true
+        }))
+        .unwrap();
+        assert!(request.enabled);
+        assert!(request.encode_danmu);
     }
 }

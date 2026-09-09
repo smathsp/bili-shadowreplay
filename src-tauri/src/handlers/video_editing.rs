@@ -3,8 +3,11 @@ use crate::state_type;
 use base64::Engine;
 use recorder::platforms::PlatformType;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+
+const TRANSITION_DURATION_SECONDS: f64 = 1.0;
 
 #[cfg(feature = "gui")]
 use tauri::State as TauriState;
@@ -72,6 +75,63 @@ fn resolve_video_path(output_dir: &Path, file: &str) -> PathBuf {
     }
 }
 
+fn build_transition_filter(durations: &[f64], transition_type: &str) -> Result<String, String> {
+    if durations.len() < 2 {
+        return Err("At least two videos are required for a transition".to_string());
+    }
+    if durations
+        .iter()
+        .any(|duration| *duration <= TRANSITION_DURATION_SECONDS)
+    {
+        return Err("Every video must be longer than the transition duration".to_string());
+    }
+    let xfade_transition = match transition_type {
+        "fade" => "fade",
+        "dissolve" => "dissolve",
+        "wipeleft" => "wipeleft",
+        "wiperight" => "wiperight",
+        "slideup" => "slideup",
+        "slidedown" => "slidedown",
+        _ => return Err(format!("Unsupported transition: {transition_type}")),
+    };
+
+    let mut filters = Vec::new();
+    for i in 0..(durations.len() - 1) {
+        let first_video = if i == 0 {
+            "[0:v]".to_string()
+        } else {
+            format!("[v{i}]")
+        };
+        let first_audio = if i == 0 {
+            "[0:a]".to_string()
+        } else {
+            format!("[a{i}]")
+        };
+        let is_last = i == durations.len() - 2;
+        let video_output = if is_last {
+            "[outv]".to_string()
+        } else {
+            format!("[v{}]", i + 1)
+        };
+        let audio_output = if is_last {
+            "[outa]".to_string()
+        } else {
+            format!("[a{}]", i + 1)
+        };
+        let offset = durations.iter().take(i + 1).sum::<f64>()
+            - (i as f64 + 1.0) * TRANSITION_DURATION_SECONDS;
+        filters.push(format!(
+            "{first_video}[{}:v]xfade=transition={xfade_transition}:duration={TRANSITION_DURATION_SECONDS}:offset={offset}{video_output}",
+            i + 1
+        ));
+        filters.push(format!(
+            "{first_audio}[{}:a]acrossfade=d={TRANSITION_DURATION_SECONDS}{audio_output}",
+            i + 1
+        ));
+    }
+    Ok(filters.join(";"))
+}
+
 /// Extract frames from a video at specific timestamps or evenly distributed
 #[cfg_attr(feature = "gui", tauri::command)]
 pub async fn extract_video_frames(
@@ -80,6 +140,13 @@ pub async fn extract_video_frames(
     timestamps: Vec<f64>,
     max_frames: usize,
 ) -> Result<Vec<VideoFrame>, String> {
+    if timestamps
+        .iter()
+        .any(|timestamp| !timestamp.is_finite() || *timestamp < 0.0)
+    {
+        return Err("timestamps must contain only non-negative finite numbers".to_string());
+    }
+
     // Get video info
     let video = state
         .db
@@ -95,22 +162,28 @@ pub async fn extract_video_frames(
 
     // Get video duration
     let metadata = get_video_metadata_internal(&video_path).await?;
+    if !metadata.duration.is_finite() || metadata.duration <= 0.0 {
+        return Err("Video duration is unavailable or invalid".to_string());
+    }
 
     // Determine timestamps to extract
     let extract_timestamps = if timestamps.is_empty() {
         // Evenly distribute frames
-        let count = max_frames.min(10);
+        let count = max_frames.clamp(1, 10);
         (0..count)
             .map(|i| (i as f64 / count as f64) * metadata.duration)
             .collect::<Vec<_>>()
     } else {
-        timestamps.into_iter().take(max_frames).collect()
+        timestamps
+            .into_iter()
+            .take(max_frames.clamp(1, 10))
+            .collect()
     };
 
     let mut frames = Vec::new();
 
     for ts in extract_timestamps {
-        if ts > metadata.duration {
+        if ts >= metadata.duration {
             continue;
         }
 
@@ -127,7 +200,11 @@ pub async fn extract_video_frames(
 
 /// Extract a single frame at a specific timestamp
 async fn extract_frame_at_timestamp(video_path: &Path, timestamp: f64) -> Result<String, String> {
-    let output_path = std::env::temp_dir().join(format!("frame_{}.jpg", timestamp));
+    let output_path = std::env::temp_dir().join(format!(
+        "bsr_frame_{}_{}.jpg",
+        timestamp,
+        uuid::Uuid::new_v4()
+    ));
 
     let ffmpeg_path = get_ffmpeg_path();
     let mut cmd = tokio::process::Command::new(ffmpeg_path);
@@ -139,25 +216,23 @@ async fn extract_frame_at_timestamp(video_path: &Path, timestamp: f64) -> Result
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    cmd.args([
-        "-ss",
-        &timestamp.to_string(),
-        "-i",
-        video_path.to_str().unwrap(),
-        "-vframes",
-        "1",
-        "-q:v",
-        "2",
-        "-y",
-        output_path.to_str().unwrap(),
-    ]);
+    cmd.arg("-ss")
+        .arg(timestamp.to_string())
+        .arg("-i")
+        .arg(video_path)
+        .args(["-vframes", "1", "-q:v", "2", "-y"])
+        .arg(&output_path);
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+    let output = match cmd.output().await {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&output_path).await;
+            return Err(format!("Failed to run ffmpeg: {error}"));
+        }
+    };
 
     if !output.status.success() {
+        let _ = tokio::fs::remove_file(&output_path).await;
         return Err(format!(
             "FFmpeg failed: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -165,14 +240,11 @@ async fn extract_frame_at_timestamp(video_path: &Path, timestamp: f64) -> Result
     }
 
     // Read and encode to base64
-    let image_data = tokio::fs::read(&output_path)
-        .await
-        .map_err(|e| format!("Failed to read frame: {}", e))?;
+    let image_data = tokio::fs::read(&output_path).await;
+    let _ = tokio::fs::remove_file(&output_path).await;
+    let image_data = image_data.map_err(|e| format!("Failed to read frame: {}", e))?;
 
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&image_data);
-
-    // Cleanup
-    let _ = tokio::fs::remove_file(&output_path).await;
 
     Ok(base64_data)
 }
@@ -217,8 +289,8 @@ async fn get_video_metadata_internal(video_path: &Path) -> Result<VideoMetadata,
         "json",
         "-show_format",
         "-show_streams",
-        video_path.to_str().unwrap(),
-    ]);
+    ])
+    .arg(video_path);
 
     let output = cmd
         .output()
@@ -244,6 +316,7 @@ async fn get_video_metadata_internal(video_path: &Path) -> Result<VideoMetadata,
         .get("duration")
         .and_then(|d| d.as_str())
         .and_then(|d| d.parse::<f64>().ok())
+        .filter(|duration| duration.is_finite() && *duration >= 0.0)
         .unwrap_or(0.0);
 
     let file_size = format
@@ -287,7 +360,8 @@ async fn get_video_metadata_internal(video_path: &Path) -> Result<VideoMetadata,
             if parts.len() == 2 {
                 let num = parts[0].parse::<f64>().ok()?;
                 let den = parts[1].parse::<f64>().ok()?;
-                Some(num / den)
+                let fps = num / den;
+                (den != 0.0 && fps.is_finite() && fps >= 0.0).then_some(fps)
             } else {
                 None
             }
@@ -327,11 +401,14 @@ pub async fn analyze_danmu_highlights(
     time_window: f64,
     min_density: usize,
 ) -> Result<Vec<DanmuHighlight>, String> {
+    if !time_window.is_finite() || time_window < 0.001 {
+        return Err("time_window must be at least 0.001 seconds".to_string());
+    }
     // Get danmu records using recorder_manager
     let platform_type = PlatformType::from_str(&platform)?;
     let danmu_records = state
         .recorder_manager
-        .load_danmus(platform_type, &room_id, &live_id)
+        .load_relative_danmus(platform_type, &room_id, &live_id)
         .await
         .map_err(|e| format!("Failed to get danmu: {}", e))?;
 
@@ -339,44 +416,27 @@ pub async fn analyze_danmu_highlights(
         return Ok(Vec::new());
     }
 
-    // Find max timestamp to determine total duration
-    let max_ts = danmu_records.iter().map(|d| d.ts).max().unwrap_or(0);
-
-    let duration = max_ts as f64 / 1000.0; // Convert ms to seconds
-    let window_count = (duration / time_window).ceil() as usize;
-
+    let mut windows = BTreeMap::<usize, Vec<&recorder::danmu::DanmuEntry>>::new();
+    for record in &danmu_records {
+        let timestamp = record.ts as f64 / 1000.0;
+        let index = (timestamp / time_window).floor() as usize;
+        windows.entry(index).or_default().push(record);
+    }
     let mut highlights = Vec::new();
-
-    for i in 0..window_count {
-        let start_time = i as f64 * time_window;
-        let end_time = ((i + 1) as f64 * time_window).min(duration);
-
-        let start_ts = (start_time * 1000.0) as i64;
-        let end_ts = (end_time * 1000.0) as i64;
-
-        // Count comments in this window
-        let comments_in_window: Vec<_> = danmu_records
-            .iter()
-            .filter(|d| d.ts >= start_ts && d.ts < end_ts)
-            .collect();
-
+    for (index, comments_in_window) in windows {
         let count = comments_in_window.len();
-
         if count >= min_density {
-            let density = count as f64 / time_window;
-
-            // Sample some comments
             let sample_comments: Vec<String> = comments_in_window
                 .iter()
                 .take(5)
                 .map(|d| d.content.clone())
                 .collect();
-
+            let start_time = index as f64 * time_window;
             highlights.push(DanmuHighlight {
                 start_time,
-                end_time,
+                end_time: start_time + time_window,
                 comment_count: count,
-                density,
+                density: count as f64 / time_window,
                 sample_comments,
             });
         }
@@ -395,10 +455,21 @@ pub async fn search_danmu_keywords(
     keywords: Vec<String>,
     context_seconds: f64,
 ) -> Result<Vec<DanmuKeywordMatch>, String> {
+    if !context_seconds.is_finite() || context_seconds < 0.0 {
+        return Err("context_seconds must be a non-negative finite number".to_string());
+    }
+    let keywords = keywords
+        .into_iter()
+        .map(|keyword| keyword.trim().to_string())
+        .filter(|keyword| !keyword.is_empty())
+        .collect::<Vec<_>>();
+    if keywords.is_empty() {
+        return Err("keywords must contain at least one non-empty value".to_string());
+    }
     let platform_type = PlatformType::from_str(&platform)?;
     let danmu_records = state
         .recorder_manager
-        .load_danmus(platform_type, &room_id, &live_id)
+        .load_relative_danmus(platform_type, &room_id, &live_id)
         .await
         .map_err(|e| format!("Failed to get danmu: {}", e))?;
 
@@ -409,7 +480,7 @@ pub async fn search_danmu_keywords(
             if record.content.contains(keyword) {
                 let timestamp = record.ts as f64 / 1000.0;
                 let context_start = (timestamp - context_seconds).max(0.0);
-                let context_end = timestamp + context_seconds;
+                let context_end = (timestamp + context_seconds).min(f64::MAX);
 
                 matches.push(DanmuKeywordMatch {
                     timestamp,
@@ -452,6 +523,9 @@ pub async fn merge_videos(
 
     // Determine output path
     let output_dir = PathBuf::from(&state.config.read().await.output);
+    tokio::fs::create_dir_all(&output_dir)
+        .await
+        .map_err(|error| format!("Failed to create output directory: {error}"))?;
     let video_paths = videos
         .iter()
         .map(|video| resolve_video_path(&output_dir, &video.file))
@@ -497,28 +571,23 @@ pub async fn merge_videos(
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        cmd.args([
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            concat_file.to_str().unwrap(),
-            "-c",
-            "copy",
-            "-y",
-            output_path.to_str().unwrap(),
-        ]);
+        cmd.args(["-f", "concat", "-safe", "0", "-i"])
+            .arg(&concat_file)
+            .args(["-c", "copy", "-y"])
+            .arg(&output_path);
 
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
-
-        // Cleanup concat file
+        let output = cmd.output().await;
         let _ = tokio::fs::remove_file(&concat_file).await;
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&output_path).await;
+                return Err(format!("Failed to run ffmpeg: {error}"));
+            }
+        };
 
         if !output.status.success() {
+            let _ = tokio::fs::remove_file(&output_path).await;
             return Err(format!(
                 "FFmpeg merge failed: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -526,69 +595,11 @@ pub async fn merge_videos(
         }
     } else {
         // Use xfade filter for transitions
-        let transition_duration = 1.0; // 1 second transition
-
-        // Build complex filter for xfade transitions
-        let mut filter_complex = String::new();
-
-        // Load all videos
-        for (i, _video) in videos.iter().enumerate() {
-            filter_complex.push_str(&format!("[{}:v]", i));
-        }
-
-        // Chain xfade filters
-        let xfade_transition = match transition_type {
-            "fade" => "fade",
-            "dissolve" => "dissolve",
-            "wipeleft" => "wipeleft",
-            "wiperight" => "wiperight",
-            "slideup" => "slideup",
-            "slidedown" => "slidedown",
-            _ => "fade",
-        };
-
-        for i in 0..(videos.len() - 1) {
-            if i == 0 {
-                filter_complex.push_str(&format!(
-                    "[0:v][1:v]xfade=transition={}:duration={}:offset={}[v{}];",
-                    xfade_transition,
-                    transition_duration,
-                    videos[0].length as f64 - transition_duration,
-                    i + 1
-                ));
-            } else if i < videos.len() - 2 {
-                let offset: f64 = videos
-                    .iter()
-                    .take(i + 1)
-                    .map(|v| v.length as f64)
-                    .sum::<f64>()
-                    - (i as f64 + 1.0) * transition_duration;
-                filter_complex.push_str(&format!(
-                    "[v{}][{}:v]xfade=transition={}:duration={}:offset={}[v{}];",
-                    i,
-                    i + 1,
-                    xfade_transition,
-                    transition_duration,
-                    offset,
-                    i + 1
-                ));
-            } else {
-                let offset: f64 = videos
-                    .iter()
-                    .take(i + 1)
-                    .map(|v| v.length as f64)
-                    .sum::<f64>()
-                    - (i as f64 + 1.0) * transition_duration;
-                filter_complex.push_str(&format!(
-                    "[v{}][{}:v]xfade=transition={}:duration={}:offset={}[outv]",
-                    i,
-                    i + 1,
-                    xfade_transition,
-                    transition_duration,
-                    offset
-                ));
-            }
-        }
+        let durations = videos
+            .iter()
+            .map(|video| video.length as f64)
+            .collect::<Vec<_>>();
+        let filter_complex = build_transition_filter(&durations, transition_type)?;
 
         // Build ffmpeg command with multiple inputs
         let mut cmd = tokio::process::Command::new(&ffmpeg_path);
@@ -612,7 +623,7 @@ pub async fn merge_videos(
             "-map",
             "[outv]",
             "-map",
-            "0:a",
+            "[outa]",
             "-c:v",
             "libx264",
             "-preset",
@@ -622,15 +633,19 @@ pub async fn merge_videos(
             "-c:a",
             "aac",
             "-y",
-            output_path.to_str().unwrap(),
-        ]);
+        ])
+        .arg(&output_path);
 
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+        let output = match cmd.output().await {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&output_path).await;
+                return Err(format!("Failed to run ffmpeg: {error}"));
+            }
+        };
 
         if !output.status.success() {
+            let _ = tokio::fs::remove_file(&output_path).await;
             return Err(format!(
                 "FFmpeg merge with transition failed: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -639,20 +654,41 @@ pub async fn merge_videos(
     }
 
     // Get file size
-    let file_size = tokio::fs::metadata(&output_path)
-        .await
-        .map_err(|e| format!("Failed to get file size: {}", e))?
-        .len();
+    let file_size = match tokio::fs::metadata(&output_path).await {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&output_path).await;
+            return Err(format!("Failed to get file size: {error}"));
+        }
+    };
 
     // Calculate total duration
-    let total_duration: i64 = videos.iter().map(|v| v.length).sum();
+    let transition_overlap = if transition_type == "none" || videos.len() == 1 {
+        0
+    } else {
+        ((videos.len() - 1) as f64 * TRANSITION_DURATION_SECONDS) as i64
+    };
+    let total_duration = videos.iter().map(|video| video.length).sum::<i64>() - transition_overlap;
+    let cover_filename = Path::new(&output_filename)
+        .with_extension("jpg")
+        .to_string_lossy()
+        .to_string();
+    let cover = if crate::ffmpeg::generate_thumbnail(&output_path, 0.0)
+        .await
+        .is_ok()
+    {
+        cover_filename
+    } else {
+        let _ = tokio::fs::remove_file(output_path.with_extension("jpg")).await;
+        String::new()
+    };
 
     // Create new video row
     let new_video = crate::database::video::VideoRow {
         id: 0, // Will be auto-generated
         room_id: videos[0].room_id.clone(),
-        cover: String::new(),
-        file: output_path.to_string_lossy().to_string(),
+        cover,
+        file: output_filename,
         note: output_note.clone(),
         length: total_duration,
         size: file_size as i64,
@@ -667,11 +703,16 @@ pub async fn merge_videos(
     };
 
     // Insert into database
-    let result = state
-        .db
-        .add_video(&new_video)
-        .await
-        .map_err(|e| format!("Failed to insert video: {}", e))?;
+    let result = match state.db.add_video(&new_video).await {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&output_path).await;
+            if !new_video.cover.is_empty() {
+                let _ = tokio::fs::remove_file(output_dir.join(&new_video.cover)).await;
+            }
+            return Err(format!("Failed to insert video: {error}"));
+        }
+    };
 
     Ok(result.id)
 }
@@ -693,11 +734,15 @@ pub async fn extract_video_audio(state: state_type!(), video_id: i64) -> Result<
 
     // Determine output path
     let output_filename = format!(
-        "audio_{}_{}.mp3",
+        "audio_{}_{}_{}.mp3",
         video.id,
-        chrono::Local::now().format("%Y%m%d_%H%M%S")
+        chrono::Local::now().format("%Y%m%d_%H%M%S"),
+        uuid::Uuid::new_v4()
     );
     let output_path = output_dir.join(&output_filename);
+    tokio::fs::create_dir_all(&output_dir)
+        .await
+        .map_err(|error| format!("Failed to create output directory: {error}"))?;
 
     // Extract audio using ffmpeg
     let ffmpeg_path = get_ffmpeg_path();
@@ -710,24 +755,21 @@ pub async fn extract_video_audio(state: state_type!(), video_id: i64) -> Result<
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    cmd.args([
-        "-i",
-        video_path.to_str().unwrap(),
-        "-vn",
-        "-acodec",
-        "libmp3lame",
-        "-q:a",
-        "2",
-        "-y",
-        output_path.to_str().unwrap(),
-    ]);
+    cmd.arg("-i")
+        .arg(&video_path)
+        .args(["-vn", "-acodec", "libmp3lame", "-q:a", "2", "-y"])
+        .arg(&output_path);
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+    let output = match cmd.output().await {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&output_path).await;
+            return Err(format!("Failed to run ffmpeg: {error}"));
+        }
+    };
 
     if !output.status.success() {
+        let _ = tokio::fs::remove_file(&output_path).await;
         return Err(format!(
             "FFmpeg audio extraction failed: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -745,29 +787,29 @@ pub async fn get_archive_metadata(
     room_id: String,
     live_id: String,
 ) -> Result<serde_json::Value, String> {
+    let platform = PlatformType::from_str(&platform)?;
     // Use get_record instead of get_archive
     let archive = state
         .db
         .get_record(&room_id, &live_id)
         .await
         .map_err(|e| format!("Failed to get archive: {}", e))?;
+    if archive.platform != platform.as_str() {
+        return Err("Archive platform does not match the request".to_string());
+    }
 
-    // Get file path and metadata
+    // Recordings are HLS archives. There is no `output.mp4` until the user
+    // creates a clip, so inspect the actual media playlist here.
     let cache_dir = PathBuf::from(&state.config.read().await.cache);
     let file_path = cache_dir
-        .join(&platform)
-        .join(&room_id)
-        .join(&live_id)
-        .join("output.mp4");
+        .join(platform.as_str())
+        .join(&archive.room_id)
+        .join(&archive.live_id)
+        .join("playlist.m3u8");
 
     let (file_size, video_metadata) = if file_path.exists() {
-        let size = tokio::fs::metadata(&file_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-
         let metadata = get_video_metadata_internal(&file_path).await.ok();
-        (size, metadata)
+        (u64::try_from(archive.size).unwrap_or_default(), metadata)
     } else {
         (0, None)
     };
@@ -775,7 +817,7 @@ pub async fn get_archive_metadata(
     Ok(serde_json::json!({
         "live_id": archive.live_id,
         "room_id": archive.room_id,
-        "platform": platform,
+        "platform": platform.as_str(),
         "title": archive.title,
         "file_path": file_path.to_string_lossy(),
         "file_size": file_size,
@@ -807,5 +849,18 @@ mod tests {
             ),
             video_path
         );
+    }
+
+    #[test]
+    fn transition_filter_maps_final_video_and_audio_outputs() {
+        assert_eq!(
+            build_transition_filter(&[10.0, 20.0], "fade").unwrap(),
+            "[0:v][1:v]xfade=transition=fade:duration=1:offset=9[outv];[0:a][1:a]acrossfade=d=1[outa]"
+        );
+        assert_eq!(
+            build_transition_filter(&[10.0, 20.0, 30.0], "dissolve").unwrap(),
+            "[0:v][1:v]xfade=transition=dissolve:duration=1:offset=9[v1];[0:a][1:a]acrossfade=d=1[a1];[v1][2:v]xfade=transition=dissolve:duration=1:offset=28[outv];[a1][2:a]acrossfade=d=1[outa]"
+        );
+        assert!(build_transition_filter(&[10.0, 20.0], "unknown").is_err());
     }
 }

@@ -13,6 +13,7 @@ use crate::state_type;
 use crate::task::Task;
 use crate::task::TaskPriority;
 use crate::webhook::events;
+use danmu_stream::LiveEvent;
 use recorder::account::Account;
 use recorder::danmu::DanmuEntry;
 use recorder::platforms::bilibili;
@@ -25,6 +26,7 @@ use tauri::State as TauriState;
 
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::{json, Value};
 
 #[cfg_attr(feature = "gui", tauri::command)]
 pub async fn get_recorder_list(state: state_type!()) -> Result<RecorderList, ()> {
@@ -346,7 +348,68 @@ pub struct ExportDanmuOptions {
     live_id: String,
     x: i64,
     y: i64,
+    #[serde(default)]
+    offset: f64,
+    #[serde(default)]
+    local_offset: f64,
     ass: bool,
+    #[serde(default)]
+    full: bool,
+}
+
+fn seconds_to_millis(seconds: f64, field: &str) -> Result<i64, String> {
+    let millis = seconds * 1000.0;
+    if !millis.is_finite() || millis < i64::MIN as f64 || millis > i64::MAX as f64 {
+        return Err(format!("{field} is outside the supported time range"));
+    }
+    Ok(millis.round() as i64)
+}
+
+fn full_danmu_export_entry(event: &LiveEvent) -> Value {
+    if event.raw.as_object().is_some_and(|raw| !raw.is_empty()) {
+        return event.raw.clone();
+    }
+
+    let id = event
+        .data
+        .get("id")
+        .or_else(|| event.data.get("message_id"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let method = event
+        .data
+        .get("method")
+        .cloned()
+        .unwrap_or_else(|| Value::String("danmu".to_string()));
+    let user = event.data.get("user").cloned().unwrap_or_else(|| {
+        json!({
+            "id": event.data.get("user_id").cloned().unwrap_or(Value::Null),
+            "name": event.data.get("user_name").cloned().unwrap_or(Value::Null),
+        })
+    });
+    let content = event.data.get("content").cloned().unwrap_or(Value::Null);
+
+    json!({
+        "id": id,
+        "method": method,
+        "user": user,
+        "content": content,
+        "time": event.ts,
+        "platform": event.platform,
+        "roomId": event.room_id,
+        "data": event.data,
+    })
+}
+
+fn export_full_danmu_jsonl(events: &[LiveEvent]) -> Result<String, String> {
+    events
+        .iter()
+        .filter(|event| event.event_type == "danmu")
+        .map(|event| {
+            serde_json::to_string(&full_danmu_export_entry(event)).map_err(|e| e.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|lines| lines.join("\n"))
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
@@ -355,24 +418,50 @@ pub async fn export_danmu(
     options: ExportDanmuOptions,
 ) -> Result<String, String> {
     let platform = PlatformType::from_str(&options.platform)?;
+    if options.full {
+        let events = state
+            .recorder_manager
+            .load_danmu_events(platform, &options.room_id, &options.live_id)
+            .await?;
+        return export_full_danmu_jsonl(&events);
+    }
+
     let mut danmus = state
         .recorder_manager
         .load_danmus(platform, &options.room_id, &options.live_id)
         .await?;
 
     log::debug!("First danmu entry: {:?}", danmus.first());
-    // update entry ts to offset
+    let timeline_origin = seconds_to_millis(options.offset + options.local_offset, "offset")?;
     for d in &mut danmus {
-        d.ts -= (options.x + options.y) * 1000;
+        d.ts = d.ts.saturating_sub(timeline_origin);
     }
-    if options.x != 0 || options.y != 0 {
-        danmus.retain(|e| e.ts >= 0 && e.ts <= (options.y - options.x) * 1000);
+
+    let has_range = options.x != 0 || options.y != 0;
+    if has_range {
+        if options.x < 0 || options.y <= options.x {
+            return Err("Export range must satisfy 0 <= x < y".to_string());
+        }
+        let range_start = options
+            .x
+            .checked_mul(1000)
+            .ok_or("Export range start is too large")?;
+        let range_end = options
+            .y
+            .checked_mul(1000)
+            .ok_or("Export range end is too large")?;
+        danmus.retain(|entry| entry.ts >= range_start && entry.ts <= range_end);
+        for entry in &mut danmus {
+            entry.ts -= range_start;
+        }
+    } else {
+        danmus.retain(|entry| entry.ts >= 0);
     }
 
     if options.ass {
         Ok(danmu2ass::danmu_to_ass(
             danmus,
-            danmu2ass::Danmu2AssOptions::default(),
+            state.config.read().await.danmu_ass_options.clone(),
         ))
     } else {
         // map and join entries
@@ -381,6 +470,66 @@ pub async fn export_danmu(
             .map(|e| format!("{}:{}", e.ts, e.content))
             .collect::<Vec<_>>()
             .join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod export_danmu_tests {
+    use super::*;
+
+    #[test]
+    fn full_export_keeps_expected_fields_and_raw_payload() {
+        let event = LiveEvent {
+            ts: 1_788_868_414_771,
+            platform: "douyin".to_string(),
+            room_id: "123".to_string(),
+            event_type: "danmu".to_string(),
+            data: json!({
+                "id": "7683131321120630299",
+                "method": "WebcastChatMessage",
+                "user": { "id": "MS4w.test", "name": "枯枝邀明月" },
+                "content": "终于能播了"
+            }),
+            raw: json!({
+                "id": "7683131321120630299",
+                "method": "WebcastChatMessage",
+                "user": { "id": "MS4w.test", "name": "枯枝邀明月" },
+                "content": "终于能播了",
+                "time": 1_788_868_414_771_i64,
+                "payloadHex": "0102"
+            }),
+        };
+
+        let output = export_full_danmu_jsonl(&[event]).unwrap();
+        let exported: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(exported["id"], "7683131321120630299");
+        assert_eq!(exported["method"], "WebcastChatMessage");
+        assert_eq!(exported["user"]["name"], "枯枝邀明月");
+        assert_eq!(exported["content"], "终于能播了");
+        assert_eq!(exported["time"], 1_788_868_414_771_i64);
+        assert_eq!(exported["payloadHex"], "0102");
+        assert!(exported.get("raw").is_none());
+    }
+
+    #[test]
+    fn export_time_conversion_rejects_non_finite_values() {
+        assert_eq!(seconds_to_millis(1.5, "offset").unwrap(), 1500);
+        assert!(seconds_to_millis(f64::NAN, "offset").is_err());
+        assert!(seconds_to_millis(f64::INFINITY, "offset").is_err());
+    }
+
+    #[test]
+    fn full_export_excludes_non_chat_events() {
+        let event = LiveEvent {
+            ts: 1,
+            platform: "douyin".to_string(),
+            room_id: "123".to_string(),
+            event_type: "gift".to_string(),
+            data: json!({ "gift_name": "花束" }),
+            raw: Value::Null,
+        };
+
+        assert!(export_full_danmu_jsonl(&[event]).unwrap().is_empty());
     }
 }
 

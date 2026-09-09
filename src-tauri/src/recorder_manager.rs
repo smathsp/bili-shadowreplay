@@ -11,6 +11,7 @@ use crate::task::{Task, TaskManager, TaskPriority};
 use crate::webhook::events::{self, Payload};
 use crate::webhook::poster::WebhookPoster;
 use chrono::DateTime;
+use danmu_stream::LiveEvent;
 use m3u8_rs::{MediaPlaylist, MediaPlaylistType};
 use recorder::account::Account;
 use recorder::danmu::{DanmuEntry, DanmuStorage};
@@ -298,6 +299,7 @@ impl RecorderManager {
                             .show()
                             .unwrap();
                     }
+                    self.emitter.emit(&RecorderEvent::LiveStart { recorder });
                 }
                 RecorderEvent::LiveEnd {
                     platform,
@@ -323,6 +325,11 @@ impl RecorderManager {
                             .show()
                             .unwrap();
                     }
+                    self.emitter.emit(&RecorderEvent::LiveEnd {
+                        platform,
+                        room_id,
+                        recorder,
+                    });
                 }
                 RecorderEvent::RecordStart { recorder } => {
                     // add record entry into db
@@ -415,6 +422,10 @@ impl RecorderManager {
                     self.emitter
                         .emit(&RecorderEvent::DanmuReceived { room, ts, content });
                 }
+                RecorderEvent::UserNotification { title, body } => {
+                    self.emitter
+                        .emit(&RecorderEvent::UserNotification { title, body });
+                }
             }
         }
     }
@@ -425,9 +436,11 @@ impl RecorderManager {
         room_id: &str,
         recorder: &RecorderInfo,
     ) {
-        if !self.config.read().await.auto_generate.enabled {
+        let auto_generate = self.config.read().await.auto_generate.clone();
+        if !auto_generate.enabled {
             return;
         }
+        let encode_danmu = auto_generate.encode_danmu;
 
         let recorder_id = format!("{}:{}", platform.as_str(), room_id);
         log::info!("Start auto generate for {recorder_id}");
@@ -452,6 +465,7 @@ impl RecorderManager {
                     "platform": platform.as_str(),
                     "room_id": room_id,
                     "parent_id": parent_id,
+                    "encode_danmu": encode_danmu,
                 })
                 .to_string(),
             )
@@ -476,7 +490,9 @@ impl RecorderManager {
         let self_clone = self.clone();
         let task_id = task.id.clone();
         let room_id = room_id.to_string();
-        let _ = self
+        let enqueue_failure_reporter = reporter.clone();
+        let enqueue_failure_task_id = task_id.clone();
+        if let Err(error) = self
             .task_manager
             .add_task(Task::new(
                 task_id.clone(),
@@ -486,12 +502,7 @@ impl RecorderManager {
                         .generate_whole_clip(
                             Some(&reporter),
                             GenerateWholeClipParams {
-                                encode_danmu: self_clone
-                                    .config
-                                    .read()
-                                    .await
-                                    .auto_generate
-                                    .encode_danmu,
+                                encode_danmu,
                                 platform: platform.as_str().to_string(),
                                 room_id,
                                 parent_id,
@@ -502,7 +513,7 @@ impl RecorderManager {
                         .await
                     {
                         log::error!("Failed to generate whole clip: {e}");
-                        let _ = reporter
+                        reporter
                             .finish(false, &format!("Failed to generate whole clip: {e}"))
                             .await;
                         let _ = self_clone
@@ -517,7 +528,7 @@ impl RecorderManager {
                         return Err(format!("Failed to generate whole clip: {e}"));
                     }
 
-                    let _ = reporter
+                    reporter
                         .finish(true, "Whole clip generated successfully")
                         .await;
                     let _ = self_clone
@@ -532,7 +543,16 @@ impl RecorderManager {
                     Ok(())
                 },
             ))
-            .await;
+            .await
+        {
+            let message = format!("Failed to enqueue whole clip task: {error}");
+            log::error!("{message}");
+            enqueue_failure_reporter.finish(false, &message).await;
+            let _ = self
+                .db
+                .update_task(&enqueue_failure_task_id, "failed", &message, None)
+                .await;
+        }
     }
 
     pub fn set_migrating(&self, migrating: bool) {
@@ -900,8 +920,11 @@ impl RecorderManager {
 
         // example: "2025-10-18T17:18:17.004+0800"
         // convert to timestamp
-        let timestamp = DateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.3f%z")
-            .unwrap()
+        let timestamp = DateTime::parse_from_rfc3339(value)
+            .or_else(|_| DateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f%z"))
+            .map_err(|error| RecorderManagerError::HLSError {
+                err: format!("Invalid X-PROGRAM-DATE-TIME {value}: {error}"),
+            })?
             .timestamp_millis();
         Ok(timestamp)
     }
@@ -935,6 +958,65 @@ impl RecorderManager {
         Ok(storage.get_entries(0).await)
     }
 
+    /// Load danmu timestamps relative to the first recorded media segment.
+    /// This is intended for analytics and tools which operate on video time,
+    /// while `load_danmus` keeps absolute timestamps for the live player.
+    pub async fn load_relative_danmus(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+        live_id: &str,
+    ) -> Result<Vec<DanmuEntry>, RecorderManagerError> {
+        let mut danmus = self.load_danmus(platform, room_id, live_id).await?;
+        if danmus.is_empty() {
+            return Ok(danmus);
+        }
+        let start = self
+            .first_segment_timestamp(platform, room_id, live_id)
+            .await
+            .unwrap_or_else(|_| {
+                danmus
+                    .iter()
+                    .map(|entry| entry.ts)
+                    .min()
+                    .unwrap_or_default()
+            });
+        danmus.retain(|entry| entry.ts >= start);
+        for entry in &mut danmus {
+            entry.ts -= start;
+        }
+        Ok(danmus)
+    }
+
+    /// Load the complete live events for exports which must retain user and
+    /// provider-specific metadata.
+    pub async fn load_danmu_events(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+        live_id: &str,
+    ) -> Result<Vec<LiveEvent>, RecorderManagerError> {
+        let cache_path = self.config.read().await.cache.clone();
+        let cache_path = Path::new(&cache_path);
+        let mut events_path = cache_path
+            .join(platform.as_str())
+            .join(room_id)
+            .join(live_id)
+            .join("events.jsonl");
+        if !events_path.exists() {
+            let legacy_path = events_path.with_file_name("danmu.txt");
+            if !legacy_path.exists() {
+                return Ok(Vec::new());
+            }
+            events_path = legacy_path;
+        }
+        let Some(storage) = DanmuStorage::new(&events_path).await else {
+            log::error!("Failed to load complete danmu events: {events_path:?}");
+            return Ok(Vec::new());
+        };
+        Ok(storage.get_events().await)
+    }
+
     /// Get related playlists by parent id
     ///
     /// This will return a list of tuples, the first element is the title of the archive,
@@ -961,6 +1043,7 @@ impl RecorderManager {
         let archives: Vec<(String, String)> = archives
             .unwrap()
             .iter()
+            .filter(|archive| archive.platform == platform.as_str())
             .map(|a| (a.title.clone(), a.live_id.clone()))
             .collect();
 
@@ -1593,7 +1676,7 @@ impl RecorderManager {
             .await;
         if playlists.is_empty() {
             log::error!("No related playlists found: {parent_id}");
-            return Ok(());
+            return Err(RecorderManagerError::EmptyPlaylist);
         }
 
         if let Some(selected_live_ids) = selected_live_ids {
@@ -1612,7 +1695,7 @@ impl RecorderManager {
 
         if playlists.is_empty() {
             log::error!("No selected playlists found: {parent_id}");
-            return Ok(());
+            return Err(RecorderManagerError::EmptyPlaylist);
         }
 
         let title = playlists.first().unwrap().title.clone();
@@ -1660,9 +1743,9 @@ impl RecorderManager {
         };
 
         let cover_filename = output_filename.with_extension("jpg");
-
-        let output_path =
-            Path::new(&self.config.read().await.output.as_str()).join(&output_filename);
+        let output_dir = PathBuf::from(&self.config.read().await.output);
+        tokio::fs::create_dir_all(&output_dir).await?;
+        let output_path = output_dir.join(&output_filename);
 
         let playlists_refs: Vec<&Path> = playlists.iter().map(|p| p.path.as_path()).collect();
 
@@ -1678,20 +1761,30 @@ impl RecorderManager {
         .await
         {
             log::error!("Failed to concat playlists: {e}");
+            let _ = tokio::fs::remove_file(&output_path).await;
             return Err(RecorderManagerError::HLSError {
                 err: "Failed to concat playlists".into(),
             });
         }
 
-        let metadata = std::fs::metadata(&output_path);
-        if metadata.is_err() {
-            return Err(RecorderManagerError::HLSError {
-                err: "Failed to get file metadata".into(),
-            });
-        }
-        let size = metadata.unwrap().len() as i64;
+        let metadata = match std::fs::metadata(&output_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&output_path).await;
+                return Err(error.into());
+            }
+        };
+        let size = match i64::try_from(metadata.len()) {
+            Ok(size) => size,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&output_path).await;
+                return Err(RecorderManagerError::ClipError {
+                    err: format!("Generated file is too large: {error}"),
+                });
+            }
+        };
 
-        let video_metadata = crate::ffmpeg::extract_video_metadata(Path::new(&output_path)).await;
+        let video_metadata = crate::ffmpeg::extract_video_metadata(&output_path).await;
         let mut length = 0;
         if let Ok(video_metadata) = video_metadata {
             length = video_metadata.duration as i64;
@@ -1702,34 +1795,77 @@ impl RecorderManager {
             );
         }
 
-        let _ = crate::ffmpeg::generate_thumbnail(Path::new(&output_path), 0.0).await;
-        let _ = crate::ffmpeg::extract_audio_sample(Path::new(&output_path)).await;
+        let cover = if crate::ffmpeg::generate_thumbnail(&output_path, 0.0)
+            .await
+            .is_ok()
+        {
+            cover_filename.to_string_lossy().to_string()
+        } else {
+            let _ = tokio::fs::remove_file(output_path.with_extension("jpg")).await;
+            String::new()
+        };
+        if crate::ffmpeg::extract_audio_sample(&output_path)
+            .await
+            .is_err()
+        {
+            let _ = tokio::fs::remove_file(output_path.with_extension("opus")).await;
+        }
 
-        let video = self
-            .db
-            .add_video(&VideoRow {
-                id: 0,
-                status: 0,
-                room_id: room_id.to_string(),
-                created_at: chrono::Local::now().to_rfc3339(),
-                cover: cover_filename.to_string_lossy().to_string(),
-                file: output_filename.to_string_lossy().to_string(),
-                note: "".into(),
-                length,
-                size,
-                bvid: String::new(),
-                title: String::new(),
-                desc: String::new(),
-                tags: String::new(),
-                area: 0,
-                platform: platform.as_str().to_string(),
-            })
-            .await?;
+        let video_row = VideoRow {
+            id: 0,
+            status: 0,
+            room_id: room_id.to_string(),
+            created_at: chrono::Local::now().to_rfc3339(),
+            cover,
+            file: output_filename.to_string_lossy().to_string(),
+            note: "".into(),
+            length,
+            size,
+            bvid: String::new(),
+            title: String::new(),
+            desc: String::new(),
+            tags: String::new(),
+            area: 0,
+            platform: platform.as_str().to_string(),
+        };
+        let video = match self.db.add_video(&video_row).await {
+            Ok(video) => video,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&output_path).await;
+                let _ = tokio::fs::remove_file(output_path.with_extension("jpg")).await;
+                let _ = tokio::fs::remove_file(output_path.with_extension("opus")).await;
+                return Err(error.into());
+            }
+        };
 
         let event =
             events::new_webhook_event(events::CLIP_GENERATED, events::Payload::Clip(video.clone()));
         if let Err(e) = self.webhook_poster.post_event(&event).await {
             log::error!("Post webhook event error: {e}");
+        }
+
+        if self.config.read().await.clip_notify {
+            let body = format!(
+                "生成了房间 {} 的整场切片: {}",
+                room_id,
+                output_filename.display()
+            );
+            #[cfg(feature = "gui")]
+            if let Err(error) = self
+                .app_handle
+                .notification()
+                .builder()
+                .title("BiliShadowReplay - 整场切片完成")
+                .body(body.clone())
+                .show()
+            {
+                log::warn!("Failed to show whole clip notification: {error}");
+            }
+            #[cfg(feature = "headless")]
+            self.emitter.emit(&RecorderEvent::UserNotification {
+                title: "BiliShadowReplay - 整场切片完成".to_string(),
+                body,
+            });
         }
 
         Ok(())
@@ -1803,6 +1939,8 @@ mod live_end_tests {
                 .await
                 .unwrap();
             assert_eq!(archives.len(), 2);
+            assert_eq!(archives[0].live_id, "segment-1");
+            assert_eq!(archives[1].live_id, "segment-2");
             assert!(archives
                 .iter()
                 .all(|archive| archive.live_id.starts_with("segment-")));

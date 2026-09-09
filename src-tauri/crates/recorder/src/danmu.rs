@@ -103,6 +103,11 @@ impl DanmuStorage {
         .await
     }
 
+    /// Return the complete persisted events without discarding provider data.
+    pub async fn get_events(&self) -> Vec<LiveEvent> {
+        self.cache.read().await.clone()
+    }
+
     // get entries with ts relative to live start time
     pub async fn get_entries(&self, live_start_ts: i64) -> Vec<DanmuEntry> {
         let mut danmus: Vec<DanmuEntry> = self

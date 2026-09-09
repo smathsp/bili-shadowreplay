@@ -209,6 +209,21 @@ impl DouyinRecorder {
                         Ok(Some(msg)) => {
                             match msg {
                                 DanmuMessageType::Event(event) => {
+                                    if event.event_type == "danmu" {
+                                        let content = event
+                                            .data
+                                            .get("content")
+                                            .and_then(|value| value.as_str())
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let _ = self.event_channel.send(
+                                            RecorderEvent::DanmuReceived {
+                                                room: self.room_id.clone(),
+                                                ts: event.ts,
+                                                content,
+                                            },
+                                        );
+                                    }
                                     if let Some(storage) = self.danmu_storage.read().await.as_ref() {
                                         if let Err(error) = storage.add_event(event).await {
                                             log::error!("Failed to persist live event: {error}");

@@ -49,7 +49,7 @@
     onSendDanmaku?: (message: string) => void;
     onDanmuAccountChange?: (uid: string) => void;
     recorders?: RecorderInfo[];
-    onExportDanmu?: (ass: boolean) => void;
+    onExportDanmu?: (format: "txt" | "ass" | "jsonl") => void;
     onNavigateLive?: (recorder: RecorderInfo) => void;
   }
 
@@ -403,16 +403,24 @@
             <button
               type="button"
               class="menu-item"
-              onclick={() => onExportDanmu?.(false)}
+              onclick={() => onExportDanmu?.("txt")}
             >
               导出弹幕为 TXT
             </button>
             <button
               type="button"
               class="menu-item"
-              onclick={() => onExportDanmu?.(true)}
+              onclick={() => onExportDanmu?.("ass")}
             >
               导出弹幕为 ASS
+            </button>
+            <button
+              type="button"
+              class="menu-item"
+              title="包含消息 ID、用户资料、平台原始字段等信息"
+              onclick={() => onExportDanmu?.("jsonl")}
+            >
+              导出完整弹幕为 JSONL
             </button>
             <div class="menu-divider"></div>
             <span class="menu-heading">快捷跳转</span>

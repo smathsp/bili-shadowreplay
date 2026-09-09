@@ -58,7 +58,7 @@ impl Database {
     ) -> Result<Vec<RecordRow>, DatabaseError> {
         let lock = self.db.read().await.clone().unwrap();
         Ok(sqlx::query_as::<_, RecordRow>(
-            "SELECT * FROM records WHERE room_id = $1 and parent_id = $2",
+            "SELECT * FROM records WHERE room_id = $1 and parent_id = $2 ORDER BY created_at ASC, live_id ASC",
         )
         .bind(room_id)
         .bind(parent_id)

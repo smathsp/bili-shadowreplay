@@ -36,4 +36,8 @@ pub enum RecorderEvent {
         ts: i64,
         content: String,
     },
+    UserNotification {
+        title: String,
+        body: String,
+    },
 }

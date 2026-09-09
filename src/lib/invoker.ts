@@ -233,6 +233,31 @@ function createSocket() {
       });
     }
   });
+
+  socket.on("notification", (data) => {
+    const listeners = eventListeners.get("notification");
+    listeners?.forEach((callback) => {
+      try {
+        callback({ payload: data });
+      } catch (error) {
+        console.error("[Socket.IO] Notification listener error:", error);
+      }
+    });
+
+    if (
+      "Notification" in window &&
+      Notification.permission === "granted" &&
+      typeof data?.title === "string"
+    ) {
+      try {
+        new Notification(data.title, {
+          body: typeof data.body === "string" ? data.body : "",
+        });
+      } catch (error) {
+        console.warn("[Socket.IO] Failed to show browser notification:", error);
+      }
+    }
+  });
 }
 
 if (!TAURI_ENV) {

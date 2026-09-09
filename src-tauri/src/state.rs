@@ -28,5 +28,7 @@ pub struct State {
     #[cfg(feature = "headless")]
     pub progress_manager: Arc<ProgressManager>,
     #[cfg(feature = "headless")]
+    pub log_dir: PathBuf,
+    #[cfg(feature = "headless")]
     pub readonly: bool,
 }

@@ -27,7 +27,7 @@
     toggleDanmu(): void;
     setDanmuOffset(offset: number): void;
     sendDanmaku(message: string): Promise<void>;
-    exportDanmu(ass: boolean): Promise<void>;
+    exportDanmu(format: "txt" | "ass" | "jsonl"): Promise<void>;
     seekLive(): void;
   }
 
@@ -584,7 +584,7 @@
         onSendDanmaku={(message) => player?.sendDanmaku(message)}
         onDanmuAccountChange={(uid) => (danmu_account_uid = uid)}
         recorders={live_recorders}
-        onExportDanmu={(ass) => player?.exportDanmu(ass)}
+        onExportDanmu={(format) => player?.exportDanmu(format)}
         onNavigateLive={navigate_to_recorder}
         onRangeDragStart={pauseForRangeDrag}
         onRangeDrag={seekDuringRangeDrag}

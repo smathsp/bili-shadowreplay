@@ -63,6 +63,8 @@
   let llmSaving = $state(false);
   let llmSaveMessage = $state("");
   let llmError = $state("");
+  let containerCachePath = $state("");
+  let containerOutputPath = $state("");
 
   function handleEndpointChange() {
     endpointValue = normalizeEndpoint(endpointValue);
@@ -74,6 +76,8 @@
   async function get_config() {
     let config: Config = await invoke("get_config");
     setting_model = config;
+    containerCachePath = config.cache;
+    containerOutputPath = config.output;
     console.log(config);
   }
 
@@ -83,6 +87,23 @@
   }
 
   async function update_notify() {
+    const browserNotifyEnabled =
+      setting_model.live_start_notify ||
+      setting_model.live_end_notify ||
+      setting_model.clip_notify ||
+      setting_model.post_notify;
+    if (
+      !TAURI_ENV &&
+      browserNotifyEnabled &&
+      "Notification" in window &&
+      Notification.permission === "default"
+    ) {
+      try {
+        await Notification.requestPermission();
+      } catch (error) {
+        console.warn("无法请求浏览器通知权限", error);
+      }
+    }
     await invoke("update_notify", {
       liveStartNotify: setting_model.live_start_notify,
       liveEndNotify: setting_model.live_end_notify,
@@ -110,7 +131,55 @@
   }
 
   async function handleLogFolder() {
-    await invoke("open_log_folder");
+    if (TAURI_ENV) {
+      await invoke("open_log_folder");
+      return;
+    }
+    const content = await invoke<string>("get_logs");
+    const url = URL.createObjectURL(
+      new Blob([content], { type: "text/plain;charset=utf-8" }),
+    );
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "bsr.log";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+
+  async function updateContainerCachePath() {
+    const nextPath = containerCachePath.trim();
+    if (!nextPath || nextPath === setting_model.cache) return;
+    if (!confirm("更改缓存路径会暂停录制并迁移现有缓存，确定继续吗？")) {
+      containerCachePath = setting_model.cache;
+      return;
+    }
+    try {
+      await invoke("set_cache_path", { cachePath: nextPath });
+      setting_model.cache = nextPath;
+      alert("缓存已迁移；请重启容器，使文件访问地址切换到新路径。");
+    } catch (error) {
+      await get_config().catch(() => {
+        containerCachePath = setting_model.cache;
+      });
+      alert(error);
+    }
+  }
+
+  async function updateContainerOutputPath() {
+    const nextPath = containerOutputPath.trim();
+    if (!nextPath || nextPath === setting_model.output) return;
+    if (!confirm("更改切片路径会迁移已有输出文件，确定继续吗？")) {
+      containerOutputPath = setting_model.output;
+      return;
+    }
+    try {
+      await invoke("set_output_path", { outputPath: nextPath });
+      setting_model.output = nextPath;
+      alert("切片已迁移；请重启容器，使文件访问地址切换到新路径。");
+    } catch (error) {
+      containerOutputPath = setting_model.output;
+      alert(error);
+    }
   }
 
   async function confirmChange() {
@@ -161,6 +230,28 @@
       await invoke("update_whisper_model", {
         whisperModel: setting_model.whisper_model,
       });
+    }
+  }
+
+  async function updateWhisperModelPath() {
+    setting_model.whisper_model = setting_model.whisper_model.trim();
+    await invoke("update_whisper_model", {
+      whisperModel: setting_model.whisper_model,
+    });
+  }
+
+  async function requestBrowserNotifications() {
+    if (!("Notification" in window)) {
+      alert("当前浏览器不支持系统通知。");
+      return;
+    }
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        alert("浏览器通知尚未授权，请检查站点权限以及 HTTPS/localhost 访问方式。");
+      }
+    } catch (error) {
+      alert(`请求浏览器通知权限失败：${error}`);
     }
   }
 
@@ -349,8 +440,7 @@
           </div>
         {/if}
 
-        {#if TAURI_ENV || endpoint != ""}
-          <!-- Storage Settings -->
+        <!-- Storage Settings -->
           {#if TAURI_ENV}
             <div class="space-y-4">
               <h2
@@ -425,6 +515,81 @@
                 </div>
               </div>
             </div>
+          {:else}
+            <div class="space-y-4">
+              <h2
+                class="text-lg font-medium text-gray-900 dark:text-white flex items-center space-x-2"
+              >
+                <HardDrive class="w-5 h-5 dark:icon-white" />
+                <span>容器存储设置</span>
+              </h2>
+              <div
+                class="bg-white dark:bg-[#3c3c3e] rounded-xl border border-gray-200 dark:border-gray-700 divide-y divide-gray-200 dark:divide-gray-700"
+              >
+                <div class="p-4">
+                  <div class="flex items-center justify-between gap-4">
+                    <div>
+                      <h3 class="text-sm font-medium text-gray-900 dark:text-white">
+                        缓存路径
+                      </h3>
+                      <p class="text-sm text-gray-500 dark:text-gray-400">
+                        必须填写容器内已挂载的持久化目录。
+                      </p>
+                    </div>
+                    <div class="flex items-center gap-2">
+                      <input
+                        type="text"
+                        class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-72"
+                        bind:value={containerCachePath}
+                      />
+                      <button
+                        class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                        onclick={updateContainerCachePath}>保存</button
+                      >
+                    </div>
+                  </div>
+                </div>
+                <div class="p-4">
+                  <div class="flex items-center justify-between gap-4">
+                    <div>
+                      <h3 class="text-sm font-medium text-gray-900 dark:text-white">
+                        切片保存路径
+                      </h3>
+                      <p class="text-sm text-gray-500 dark:text-gray-400">
+                        必须填写容器内已挂载的持久化目录。
+                      </p>
+                    </div>
+                    <div class="flex items-center gap-2">
+                      <input
+                        type="text"
+                        class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-72"
+                        bind:value={containerOutputPath}
+                      />
+                      <button
+                        class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                        onclick={updateContainerOutputPath}>保存</button
+                      >
+                    </div>
+                  </div>
+                </div>
+                <div class="p-4">
+                  <div class="flex items-center justify-between">
+                    <div>
+                      <h3 class="text-sm font-medium text-gray-900 dark:text-white">
+                        运行日志
+                      </h3>
+                      <p class="text-sm text-gray-500 dark:text-gray-400">
+                        下载容器当前日志文件。
+                      </p>
+                    </div>
+                    <button
+                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                      onclick={handleLogFolder}>下载</button
+                    >
+                  </div>
+                </div>
+              </div>
+            </div>
           {/if}
 
           <!-- Notification Settings -->
@@ -438,6 +603,24 @@
             <div
               class="bg-white dark:bg-[#3c3c3e] rounded-xl border border-gray-200 dark:border-gray-700 divide-y divide-gray-200 dark:divide-gray-700"
             >
+              {#if !TAURI_ENV}
+                <div class="p-4">
+                  <div class="flex items-center justify-between gap-4">
+                    <div>
+                      <h3 class="text-sm font-medium text-gray-900 dark:text-white">
+                        浏览器通知权限
+                      </h3>
+                      <p class="text-sm text-gray-500 dark:text-gray-400">
+                        Docker 版通过浏览器发送通知，需要保持页面打开。
+                      </p>
+                    </div>
+                    <button
+                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                      onclick={requestBrowserNotifications}>授权</button
+                    >
+                  </div>
+                </div>
+              {/if}
               <!-- Stream Start -->
               <div class="p-4">
                 <div class="flex items-center justify-between">
@@ -787,7 +970,7 @@
                   </div>
                 </div>
               {:else}
-                {#if TAURI_ENV && setting_model.subtitle_generator_type === "whisper"}
+                {#if setting_model.subtitle_generator_type === "whisper"}
                   <div class="p-4">
                     <div class="flex items-center justify-between">
                       <div>
@@ -806,12 +989,32 @@
                               rel="noopener noreferrer">ggerganov/whisper.cpp</a
                             > 下载模型文件</span
                           >
+                          {#if !TAURI_ENV}
+                            <span class="block mt-1 text-xs"
+                              >若设置了 WHISPER_MODEL 环境变量，容器重启后以环境变量为准。</span
+                            >
+                          {/if}
                         </p>
                       </div>
-                      <button
-                        class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
-                        onclick={handleWhisperModelPathChange}>变更</button
-                      >
+                      {#if TAURI_ENV}
+                        <button
+                          class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                          onclick={handleWhisperModelPathChange}>变更</button
+                        >
+                      {:else}
+                        <div class="flex items-center gap-2">
+                          <input
+                            type="text"
+                            class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-72"
+                            bind:value={setting_model.whisper_model}
+                            placeholder="/app/whisper_model.bin"
+                          />
+                          <button
+                            class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                            onclick={updateWhisperModelPath}>保存</button
+                          >
+                        </div>
+                      {/if}
                     </div>
                   </div>
                 {/if}
@@ -1157,7 +1360,6 @@
               </div>
             </div>
           </div>
-        {/if}
       </div>
     </div>
   </div>

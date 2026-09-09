@@ -9,6 +9,8 @@ use crate::task::{Task, TaskPriority};
 use crate::webhook::events;
 use base64::Engine;
 use chrono::{Local, Utc};
+#[cfg(feature = "headless")]
+use recorder::events::RecorderEvent;
 use recorder::platforms::bilibili;
 use recorder::platforms::bilibili::profile::Profile;
 use serde_json::json;
@@ -529,6 +531,14 @@ async fn clip_range_inner(
             ))
             .show()
             .unwrap();
+        #[cfg(feature = "headless")]
+        let _ = state
+            .progress_manager
+            .get_event_sender()
+            .send(RecorderEvent::UserNotification {
+                title: "BiliShadowReplay - 切片完成".to_string(),
+                body: format!("生成了房间 {} 的切片: {}", params.room_id, filename),
+            });
     }
 
     reporter.finish(true, "切片完成").await;
@@ -649,6 +659,13 @@ async fn upload_procedure_inner(
                         .body(format!("投稿了房间 {} 的切片: {}", room_id, ret.bvid))
                         .show()
                         .unwrap();
+                    #[cfg(feature = "headless")]
+                    let _ = state.progress_manager.get_event_sender().send(
+                        RecorderEvent::UserNotification {
+                            title: "BiliShadowReplay - 投稿成功".to_string(),
+                            body: format!("投稿了房间 {} 的切片: {}", room_id, ret.bvid),
+                        },
+                    );
                 }
                 reporter.finish(true, "投稿成功").await;
                 Ok(ret.bvid)

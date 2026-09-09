@@ -16,8 +16,10 @@ services:
             - ./whisper_model.bin:/app/whisper_model.bin
         environment:
             DATA_DIR: /app/data
+            CONFIG_PATH: /app/data/config.toml
             CACHE_DIR: /app/cache
             OUTPUT_DIR: /app/output
+            LOG_DIR: /app/data/logs
             WHISPER_MODEL: /app/whisper_model.bin
 
 

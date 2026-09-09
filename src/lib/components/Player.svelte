@@ -1427,9 +1427,9 @@ ${mediaPlaylistUrl}`;
   // set body background color to black
   document.body.style.backgroundColor = "black";
 
-  export async function exportDanmu(ass: boolean) {
+  export async function exportDanmu(format: "txt" | "ass" | "jsonl") {
     console.log("Export danmus");
-    const assContent = (await invoke("export_danmu", {
+    const content = (await invoke("export_danmu", {
       options: {
         platform: platform,
         roomId: room_id,
@@ -1437,24 +1437,33 @@ ${mediaPlaylistUrl}`;
         x: Math.floor(start),
         y: Math.floor(end),
         offset: global_offset,
-        ass: ass,
+        localOffset: local_offset,
+        ass: format === "ass",
+        full: format === "jsonl",
       },
     })) as string;
 
-    let file_name = `danmu_${room_id}_${live_id}.${ass ? "ass" : "txt"}`;
+    const file_name = `danmu_${room_id}_${live_id}.${format}`;
     if (TAURI_ENV) {
       const path = await save({
-        title: "导出弹幕",
+        title: format === "jsonl" ? "导出完整弹幕" : "导出弹幕",
         defaultPath: file_name,
       });
       if (!path) return;
-      await invoke("export_to_file", { fileName: path, content: assContent });
+      await invoke("export_to_file", { fileName: path, content });
     } else {
       const a = document.createElement("a");
-      a.href =
-        "data:text/plain;charset=utf-8," + encodeURIComponent(assContent);
+      const blob = new Blob([content], {
+        type:
+          format === "jsonl"
+            ? "application/x-ndjson;charset=utf-8"
+            : "text/plain;charset=utf-8",
+      });
+      const url = URL.createObjectURL(blob);
+      a.href = url;
       a.download = file_name;
       a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
     }
   }
 </script>
