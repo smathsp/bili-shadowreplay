@@ -61,7 +61,7 @@ test("base Compose is safe and portable while GPU support is optional", () => {
     /ghcr\.io\/smathsp\/bili-shadowreplay:latest/,
   );
   assert.match(compose, /BSR_BIND_ADDRESS:-127\.0\.0\.1/);
-  assert.match(compose, /stop_grace_period:\s*30s/);
+  assert.match(compose, /stop_grace_period:\s*60s/);
   assert.match(compose, /\/api\/health/);
   assert.doesNotMatch(compose, /^\s*devices:/m);
   assert.doesNotMatch(compose, /^\s*WHISPER_MODEL:/m);
@@ -80,6 +80,15 @@ test("Docker workflow builds natively and publishes an atomic manifest", () => {
   assert.match(workflow, /Verify published architectures/);
   assert.match(workflow, /Smoke test image runtime/);
   assert.match(workflow, /Verify GHCR push access/);
+  assert.match(workflow, /release_version:/);
+  assert.match(
+    workflow,
+    /type=semver,pattern=\{\{version\}\},value=\$\{\{ inputs\.release_version \}\}/,
+  );
+  assert.match(
+    workflow,
+    /github\.event_name == 'workflow_dispatch'[\s\S]*?type=raw,value=latest/,
+  );
 });
 
 test("Release workflow only builds tags and has full history for changelogs", () => {

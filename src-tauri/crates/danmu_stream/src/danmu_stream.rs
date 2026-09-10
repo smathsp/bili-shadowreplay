@@ -13,8 +13,8 @@ pub struct DanmuStream {
     pub identifier: String,
     pub room_id: String,
     pub provider: Arc<RwLock<Box<dyn DanmuProvider>>>,
-    tx: mpsc::UnboundedSender<DanmuMessageType>,
-    rx: Arc<RwLock<mpsc::UnboundedReceiver<DanmuMessageType>>>,
+    tx: mpsc::Sender<DanmuMessageType>,
+    rx: Arc<RwLock<mpsc::Receiver<DanmuMessageType>>>,
 }
 
 impl DanmuStream {
@@ -23,7 +23,10 @@ impl DanmuStream {
         identifier: &str,
         room_id: &str,
     ) -> Result<Self, DanmuStreamError> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        // Bound provider-to-recorder buffering so a slow Docker bind mount or
+        // temporary disk stall cannot grow memory without limit. Providers
+        // await capacity, preserving complete events instead of dropping them.
+        let (tx, rx) = mpsc::channel(4096);
         let provider = new(provider_type, identifier, room_id).await?;
         Ok(Self {
             provider_type,
@@ -36,14 +39,19 @@ impl DanmuStream {
     }
 
     pub async fn start(&self) -> Result<(), DanmuStreamError> {
-        self.provider.write().await.start(self.tx.clone()).await
+        // Provider methods take &self, so a shared guard lets `stop` signal a
+        // long-running connection instead of waiting forever on this lock.
+        self.provider.read().await.start(self.tx.clone()).await
     }
 
     pub async fn stop(&self) -> Result<(), DanmuStreamError> {
-        self.provider.write().await.stop().await?;
-        // close channel
+        self.provider.read().await.stop().await
+    }
+
+    /// Stop accepting provider messages while keeping already queued events
+    /// available to `recv`, so recorders can drain them before closing storage.
+    pub async fn close_receiver(&self) {
         self.rx.write().await.close();
-        Ok(())
     }
 
     pub async fn recv(&self) -> Result<Option<DanmuMessageType>, DanmuStreamError> {

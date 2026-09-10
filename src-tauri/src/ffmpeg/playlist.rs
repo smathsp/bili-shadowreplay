@@ -135,30 +135,31 @@ pub async fn clip_from_playlist(
     // transcode copy to fix timestamp
     {
         let tmp_output_path = output_path.with_extension("tmp.mp4");
-        super::transcode(reporter, output_path, &tmp_output_path, true).await?;
+        if let Err(error) = super::transcode(reporter, output_path, &tmp_output_path, true).await {
+            let _ = tokio::fs::remove_file(&tmp_output_path).await;
+            return Err(error);
+        }
 
-        // remove original file
-        let _ = tokio::fs::remove_file(output_path).await;
-        // rename tmp_output_path to output_path
-        let _ = tokio::fs::rename(tmp_output_path, output_path).await;
+        replace_output_file(&tmp_output_path, output_path, "timestamp repair").await?;
     }
 
     // trim for precised duration
     if let (Some(start_offset), Some(range)) = (start_offset, range.as_ref()) {
         let tmp_output_path = output_path.with_extension("tmp.mp4");
-        super::trim_video(
+        if let Err(error) = super::trim_video(
             reporter,
             output_path,
             &tmp_output_path,
             start_offset,
             range.duration(),
         )
-        .await?;
+        .await
+        {
+            let _ = tokio::fs::remove_file(&tmp_output_path).await;
+            return Err(error);
+        }
 
-        // remove original file
-        let _ = tokio::fs::remove_file(output_path).await;
-        // rename tmp_output_path to output_path
-        let _ = tokio::fs::rename(tmp_output_path, output_path).await;
+        replace_output_file(&tmp_output_path, output_path, "precise trim").await?;
     }
 
     Ok(())
@@ -189,6 +190,40 @@ fn parse_map_uri(rest: &str) -> Option<String> {
         let uri = unescaped.trim_matches('"');
         (!uri.is_empty()).then(|| uri.to_string())
     })
+}
+
+async fn replace_output_file(
+    temporary_path: &Path,
+    output_path: &Path,
+    operation: &str,
+) -> Result<(), String> {
+    let processed_metadata = tokio::fs::metadata(temporary_path).await.map_err(|error| {
+        format!(
+            "Processed output '{}' is unavailable after {operation}: {error}",
+            temporary_path.display()
+        )
+    })?;
+    if processed_metadata.len() == 0 {
+        return Err(format!(
+            "Processed output '{}' is empty after {operation}",
+            temporary_path.display()
+        ));
+    }
+
+    tokio::fs::remove_file(output_path).await.map_err(|error| {
+        format!(
+            "Failed to remove intermediate output '{}' after {operation}: {error}",
+            output_path.display()
+        )
+    })?;
+    tokio::fs::rename(temporary_path, output_path)
+        .await
+        .map_err(|error| {
+            format!(
+                "Failed to install processed output '{}' after {operation}: {error}",
+                output_path.display()
+            )
+        })
 }
 
 #[cfg(test)]
@@ -239,6 +274,45 @@ mod tests {
         );
         assert_eq!(parse_map_uri("malformed"), None);
     }
+
+    #[tokio::test]
+    async fn replacing_a_processed_segment_is_checked() {
+        let base = std::env::temp_dir().join(format!(
+            "bili-shadowreplay-replace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let output = base.with_extension("mp4");
+        let temporary = base.with_extension("tmp.mp4");
+        tokio::fs::write(&output, b"old").await.unwrap();
+        tokio::fs::write(&temporary, b"processed").await.unwrap();
+
+        replace_output_file(&temporary, &output, "test")
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(&output).await.unwrap(), b"processed");
+        assert!(!temporary.exists());
+        tokio::fs::remove_file(output).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_processed_segment_is_reported_without_removing_the_original() {
+        let base = std::env::temp_dir().join(format!(
+            "bili-shadowreplay-missing-processed-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let output = base.with_extension("mp4");
+        let missing_temporary = base.with_extension("tmp.mp4");
+        tokio::fs::write(&output, b"original").await.unwrap();
+
+        let error = replace_output_file(&missing_temporary, &output, "test")
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("is unavailable after test"));
+        assert_eq!(tokio::fs::read(&output).await.unwrap(), b"original");
+        tokio::fs::remove_file(output).await.unwrap();
+    }
 }
 
 pub async fn concat_playlists_to_video(
@@ -247,28 +321,164 @@ pub async fn concat_playlists_to_video(
     danmu_ass_files: Vec<Option<PathBuf>>,
     output_path: &Path,
 ) -> Result<(), String> {
+    if playlists.is_empty() {
+        return Err("No playlists to concatenate".to_string());
+    }
+    if playlists.len() != danmu_ass_files.len() {
+        return Err(format!(
+            "Playlist/danmu file count mismatch: {} playlists, {} danmu files",
+            playlists.len(),
+            danmu_ass_files.len()
+        ));
+    }
+
     let mut to_remove = Vec::new();
     let mut segments = Vec::new();
     for (i, playlist) in playlists.iter().enumerate() {
         let mut video_path = output_path.with_extension(format!("{}.mp4", i));
-        if let Err(e) = clip_from_playlist(reporter, playlist, &video_path, None).await {
-            log::error!("Failed to generate playlist video: {e}");
-            continue;
-        }
+        // Add the target before processing so a partially written segment is
+        // also removed when playlist extraction fails.
         to_remove.push(video_path.clone());
+        if let Err(error) = require_playlist_segment(
+            clip_from_playlist(reporter, playlist, &video_path, None).await,
+            i,
+            playlists.len(),
+            playlist,
+        ) {
+            log::error!("{error}");
+            remove_temporary_segments(&to_remove).await;
+            return Err(error);
+        }
+
         if let Some(danmu_ass_file) = &danmu_ass_files[i] {
-            video_path = super::encode_video_danmu(reporter, &video_path, danmu_ass_file).await?;
-            to_remove.push(video_path.clone());
+            let expected_encoded_path = video_path.with_file_name(format!(
+                "{}{}",
+                crate::constants::PREFIX_DANMAKU,
+                video_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        format!("Invalid playlist segment path: {}", video_path.display())
+                    })?
+            ));
+            // Track the output before ffmpeg starts so a failed encode cannot
+            // leave a partial [danmaku] file behind.
+            to_remove.push(expected_encoded_path.clone());
+            video_path =
+                match super::encode_video_danmu(reporter, &video_path, danmu_ass_file).await {
+                    Ok(encoded_path) => encoded_path,
+                    Err(error) => {
+                        let error = format!(
+                            "Failed to burn danmu for playlist segment {}/{} ('{}'): {error}",
+                            i + 1,
+                            playlists.len(),
+                            playlist.display()
+                        );
+                        log::error!("{error}");
+                        remove_temporary_segments(&to_remove).await;
+                        return Err(error);
+                    }
+                };
+            if video_path != expected_encoded_path {
+                to_remove.push(video_path.clone());
+            }
         }
         segments.push(video_path);
     }
 
-    super::general::concat_videos(reporter, &segments, output_path).await?;
+    let concat_result = super::general::concat_videos(reporter, &segments, output_path)
+        .await
+        .map_err(|error| {
+            format!(
+                "Failed to concatenate all {} playlist segments: {error}",
+                playlists.len()
+            )
+        });
+    remove_temporary_segments(&to_remove).await;
 
-    // clean up segments
-    for segment in to_remove {
-        let _ = tokio::fs::remove_file(segment).await;
+    concat_result
+}
+
+fn require_playlist_segment<T>(
+    result: Result<T, String>,
+    index: usize,
+    total: usize,
+    playlist: &Path,
+) -> Result<T, String> {
+    result.map_err(|error| {
+        format!(
+            "Failed to generate playlist segment {}/{} from '{}': {error}",
+            index + 1,
+            total,
+            playlist.display()
+        )
+    })
+}
+
+async fn remove_temporary_segments(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+#[cfg(test)]
+mod concat_tests {
+    use super::*;
+
+    #[test]
+    fn playlist_segment_failure_remains_fatal() {
+        let result = require_playlist_segment::<()>(
+            Err("segment file is missing".to_string()),
+            1,
+            3,
+            Path::new("douyin/room/live-2/playlist.m3u8"),
+        );
+
+        let error = result.unwrap_err();
+        assert!(error.contains("segment 2/3"));
+        assert!(error.contains("douyin/room/live-2/playlist.m3u8"));
+        assert!(error.contains("segment file is missing"));
     }
 
-    Ok(())
+    #[tokio::test]
+    async fn rejects_missing_playlist_or_danmu_entries_before_processing() {
+        let playlist = Path::new("unused.m3u8");
+        let result = concat_playlists_to_video(
+            None::<&crate::progress::progress_reporter::ProgressReporter>,
+            &[playlist],
+            Vec::new(),
+            Path::new("unused.mp4"),
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            "Playlist/danmu file count mismatch: 1 playlists, 0 danmu files"
+        );
+    }
+
+    #[tokio::test]
+    async fn concat_stops_at_a_missing_playlist_segment() {
+        let missing_playlist = std::env::temp_dir().join(format!(
+            "bili-shadowreplay-missing-{}.m3u8",
+            uuid::Uuid::new_v4()
+        ));
+        let output = missing_playlist.with_extension("mp4");
+        let playlists = [missing_playlist.as_path()];
+
+        let result = concat_playlists_to_video(
+            None::<&crate::progress::progress_reporter::ProgressReporter>,
+            &playlists,
+            vec![None],
+            &output,
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        let missing_playlist = missing_playlist.display().to_string();
+        assert!(error.contains("segment 1/1"));
+        assert!(error.contains(missing_playlist.as_str()));
+        assert!(error.contains("Failed to read playlist"));
+        assert!(!output.exists());
+    }
 }

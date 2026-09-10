@@ -70,10 +70,61 @@ pub fn generate_user_agent_header() -> reqwest::header::HeaderMap {
     headers
 }
 
+fn insert_cookie_header(
+    headers: &mut reqwest::header::HeaderMap,
+    cookies: &str,
+) -> Result<(), RecorderError> {
+    headers.insert(
+        reqwest::header::COOKIE,
+        cookies.parse().map_err(|error| RecorderError::ApiError {
+            error: format!("Invalid douyin cookie header: {error}"),
+        })?,
+    );
+    Ok(())
+}
+
 fn parse_web_room_info_response(
     data: DouyinRoomInfoResponse,
+    room_id: &str,
     sec_user_id: &str,
 ) -> Result<DouyinBasicRoomInfo, RecorderError> {
+    // Douyin returns HTTP 200 for some authentication and risk-control errors.
+    // Never interpret those payloads as an offline room: doing so would close
+    // the current live session and trigger a premature whole-session export.
+    if data.status_code != 0 {
+        return Err(RecorderError::ApiError {
+            error: format!(
+                "Douyin web room API returned status_code {}",
+                data.status_code
+            ),
+        });
+    }
+
+    // The Web enter API legitimately returns an empty room list after a live
+    // ends. Treat that as an offline status instead of forcing the less stable
+    // H5 fallback; otherwise a failed fallback keeps the recorder stuck in its
+    // previous `live` state and LiveEnd is never emitted.
+    if data.data.room_status != 0 && data.data.data.is_empty() {
+        return Ok(DouyinBasicRoomInfo {
+            room_id_str: room_id.to_string(),
+            room_title: String::new(),
+            cover: None,
+            status: data.data.room_status,
+            hls_url: String::new(),
+            stream_data: String::new(),
+            user_name: data.data.user.nickname,
+            user_avatar: data
+                .data
+                .user
+                .avatar_thumb
+                .url_list
+                .first()
+                .cloned()
+                .unwrap_or_default(),
+            sec_user_id: sec_user_id.to_string(),
+        });
+    }
+
     let room = data
         .data
         .data
@@ -94,10 +145,18 @@ fn parse_web_room_info_response(
         .first()
         .cloned()
         .unwrap_or_default();
+    let owner_sec_user_id = room
+        .owner
+        .as_ref()
+        .map(|owner| owner.sec_uid.as_str())
+        .filter(|value| !value.is_empty())
+        .or_else(|| (!data.data.user.sec_uid.is_empty()).then_some(data.data.user.sec_uid.as_str()))
+        .unwrap_or(sec_user_id)
+        .to_string();
 
     Ok(DouyinBasicRoomInfo {
         room_id_str: room.id_str.clone(),
-        sec_user_id: sec_user_id.to_string(),
+        sec_user_id: owner_sec_user_id,
         cover,
         room_title: room.title.clone(),
         user_name: data.data.user.nickname.clone(),
@@ -124,7 +183,7 @@ pub async fn get_room_info(
 ) -> Result<DouyinBasicRoomInfo, RecorderError> {
     let mut headers = generate_user_agent_header();
     headers.insert("Referer", "https://live.douyin.com/".parse().unwrap());
-    headers.insert("Cookie", account.cookies.clone().parse().unwrap());
+    insert_cookie_header(&mut headers, &account.cookies)?;
     let ms_token = generate_ms_token().await;
     let user_agent = headers.get("user-agent").unwrap().to_str().unwrap();
     let params = format!(
@@ -149,7 +208,7 @@ pub async fn get_room_info(
 
     if status.is_success() {
         if let Ok(data) = serde_json::from_str::<DouyinRoomInfoResponse>(&text) {
-            match parse_web_room_info_response(data, sec_user_id) {
+            match parse_web_room_info_response(data, room_id, sec_user_id) {
                 Ok(info) => return Ok(info),
                 Err(e) => {
                     log::warn!("Invalid douyin room info response: {e}; trying H5 API");
@@ -195,7 +254,7 @@ pub async fn get_room_info_h5(
 
     let mut headers = generate_user_agent_header();
     headers.insert("Referer", "https://live.douyin.com/".parse().unwrap());
-    headers.insert("Cookie", account.cookies.clone().parse().unwrap());
+    insert_cookie_header(&mut headers, &account.cookies)?;
 
     let resp = client.get(&url).headers(headers).send().await?;
 
@@ -304,7 +363,7 @@ pub async fn get_user_info(
     let url = "https://www.douyin.com/aweme/v1/web/im/spotlight/relation/";
     let mut headers = generate_user_agent_header();
     headers.insert("Referer", "https://www.douyin.com/".parse().unwrap());
-    headers.insert("Cookie", account.cookies.clone().parse().unwrap());
+    insert_cookie_header(&mut headers, &account.cookies)?;
 
     let resp = client.get(url).headers(headers).send().await?;
 
@@ -363,11 +422,24 @@ pub async fn get_user_info(
 
 pub async fn get_room_owner_sec_uid(
     client: &Client,
+    account: &Account,
     room_id: &str,
 ) -> Result<String, RecorderError> {
+    // Prefer the structured room response, which ties the owner to the
+    // requested web_rid. The HTML regex remains only as a compatibility
+    // fallback for offline or changed API responses.
+    if let Ok(info) = get_room_info(client, account, room_id, "").await {
+        if !info.sec_user_id.is_empty() {
+            return Ok(info.sec_user_id);
+        }
+    }
+
     let url = format!("https://live.douyin.com/{room_id}");
     let mut headers = generate_user_agent_header();
     headers.insert("Referer", "https://live.douyin.com/".parse().unwrap());
+    if !account.cookies.is_empty() {
+        insert_cookie_header(&mut headers, &account.cookies)?;
+    }
     let resp = client.get(url).headers(headers).send().await?;
     let status = resp.status();
     let text = resp.text().await?;
@@ -407,11 +479,14 @@ mod tests {
     use super::*;
     use crate::platforms::douyin::response;
 
-    fn web_room_response_with_room(room: Option<response::Daum>) -> DouyinRoomInfoResponse {
+    fn web_room_response_with_room(
+        room: Option<response::Daum>,
+        room_status: i64,
+    ) -> DouyinRoomInfoResponse {
         DouyinRoomInfoResponse {
             data: response::Data {
                 data: room.into_iter().collect(),
-                room_status: 0,
+                room_status,
                 user: response::User {
                     nickname: "主播".to_string(),
                     avatar_thumb: response::AvatarThumb { url_list: vec![] },
@@ -425,11 +500,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_web_room_info_response_rejects_empty_room_data() {
-        let err = parse_web_room_info_response(web_room_response_with_room(None), "sec_uid")
-            .expect_err("empty room data should be rejected");
+    fn parse_web_room_info_response_accepts_offline_empty_room_data() {
+        let info = parse_web_room_info_response(
+            web_room_response_with_room(None, 1),
+            "requested-room",
+            "sec_uid",
+        )
+        .expect("offline empty room data should be accepted");
+
+        assert_eq!(info.status, 1);
+        assert_eq!(info.room_id_str, "requested-room");
+        assert!(info.hls_url.is_empty());
+    }
+
+    #[test]
+    fn parse_web_room_info_response_rejects_live_empty_room_data() {
+        let err = parse_web_room_info_response(
+            web_room_response_with_room(None, 0),
+            "requested-room",
+            "sec_uid",
+        )
+        .expect_err("live empty room data should be rejected");
 
         assert!(matches!(err, RecorderError::ApiError { .. }));
+    }
+
+    #[test]
+    fn parse_web_room_info_response_rejects_api_error_as_offline() {
+        let mut response = web_room_response_with_room(None, 1);
+        response.status_code = 10011;
+
+        let error = parse_web_room_info_response(response, "requested-room", "sec_uid")
+            .expect_err("API errors must not be treated as an ended live");
+
+        assert!(error.to_string().contains("status_code 10011"));
     }
 
     #[test]
@@ -441,8 +545,12 @@ mod tests {
             ..Default::default()
         };
 
-        let info = parse_web_room_info_response(web_room_response_with_room(Some(room)), "sec_uid")
-            .expect("empty image url lists should not fail room parsing");
+        let info = parse_web_room_info_response(
+            web_room_response_with_room(Some(room), 0),
+            "requested-room",
+            "sec_uid",
+        )
+        .expect("empty image url lists should not fail room parsing");
 
         assert_eq!(info.room_id_str, "room_id");
         assert_eq!(info.room_title, "直播标题");
@@ -453,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_room_owner_sec_uid() {
         let client = Client::new();
-        let sec_uid = get_room_owner_sec_uid(&client, "200525029536")
+        let sec_uid = get_room_owner_sec_uid(&client, &Account::default(), "200525029536")
             .await
             .unwrap();
         assert_eq!(

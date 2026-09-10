@@ -24,10 +24,7 @@ pub trait DanmuProvider: Send + Sync {
     where
         Self: Sized;
 
-    async fn start(
-        &self,
-        tx: mpsc::UnboundedSender<DanmuMessageType>,
-    ) -> Result<(), DanmuStreamError>;
+    async fn start(&self, tx: mpsc::Sender<DanmuMessageType>) -> Result<(), DanmuStreamError>;
 
     async fn stop(&self) -> Result<(), DanmuStreamError>;
 }

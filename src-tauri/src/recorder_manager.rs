@@ -18,7 +18,7 @@ use recorder::danmu::{DanmuEntry, DanmuStorage};
 use recorder::errors::RecorderError;
 use recorder::events::RecorderEvent;
 use recorder::platforms::bilibili::BiliRecorder;
-use recorder::platforms::douyin::DouyinRecorder;
+use recorder::platforms::douyin::{acknowledge_live_end, DouyinRecorder};
 use recorder::platforms::huya::HuyaRecorder;
 use recorder::platforms::kuaishou::KuaishouRecorder;
 use recorder::platforms::tiktok::TikTokRecorder;
@@ -83,6 +83,33 @@ pub struct RelatedPlaylist {
     pub live_id: String,
     pub title: String,
     pub path: PathBuf,
+}
+
+fn require_danmu_ass_files(
+    live_ids: &[String],
+    results: Vec<Result<PathBuf, RecorderManagerError>>,
+) -> Result<Vec<Option<PathBuf>>, RecorderManagerError> {
+    if live_ids.len() != results.len() {
+        return Err(RecorderManagerError::ArchiveDanmuAssGenerationFailed {
+            error: format!(
+                "Archive/danmu result count mismatch: {} archives, {} results",
+                live_ids.len(),
+                results.len()
+            ),
+        });
+    }
+
+    live_ids
+        .iter()
+        .zip(results)
+        .map(|(live_id, result)| {
+            result.map(Some).map_err(|error| {
+                RecorderManagerError::ArchiveDanmuAssGenerationFailed {
+                    error: format!("archive '{live_id}': {error}"),
+                }
+            })
+        })
+        .collect()
 }
 
 pub enum RecorderType {
@@ -389,14 +416,22 @@ impl RecorderManager {
                         }
                     };
                     if record.size == 0 {
+                        let platform = PlatformType::from_str(&recorder.room_info.platform)
+                            .unwrap_or(PlatformType::BiliBili);
+                        if platform == PlatformType::Douyin && recorder.room_info.status {
+                            // The session-level danmu task can still be writing
+                            // into this attempt between HLS reconnects. Removing
+                            // the directory on Linux would unlink its open JSONL
+                            // file and permanently lose those events.
+                            log::info!(
+                                "Preserving empty active Douyin attempt for lossless danmu recovery: {live_id}"
+                            );
+                            continue;
+                        }
                         let _ = self.db.remove_record(&live_id).await;
                         // remove record folder
                         let cache_folder = Path::new(self.config.read().await.cache.as_str())
-                            .join(
-                                PlatformType::from_str(&recorder.room_info.platform)
-                                    .unwrap_or(PlatformType::BiliBili)
-                                    .as_str(),
-                            )
+                            .join(platform.as_str())
                             .join(room_id)
                             .join(live_id);
                         let _ = tokio::fs::remove_dir_all(&cache_folder).await;
@@ -438,6 +473,8 @@ impl RecorderManager {
     ) {
         let auto_generate = self.config.read().await.auto_generate.clone();
         if !auto_generate.enabled {
+            self.acknowledge_douyin_live_end(platform, room_id, &recorder.platform_live_id)
+                .await;
             return;
         }
         let encode_danmu = auto_generate.encode_danmu;
@@ -448,6 +485,8 @@ impl RecorderManager {
             Ok(Some(parent_id)) => parent_id,
             Ok(None) => {
                 log::info!("No recorded archives for ended live: {recorder_id}");
+                self.acknowledge_douyin_live_end(platform, room_id, &recorder.platform_live_id)
+                    .await;
                 return;
             }
             Err(error) => {
@@ -490,6 +529,7 @@ impl RecorderManager {
         let self_clone = self.clone();
         let task_id = task.id.clone();
         let room_id = room_id.to_string();
+        let ended_session_id = recorder.platform_live_id.clone();
         let enqueue_failure_reporter = reporter.clone();
         let enqueue_failure_task_id = task_id.clone();
         if let Err(error) = self
@@ -504,7 +544,7 @@ impl RecorderManager {
                             GenerateWholeClipParams {
                                 encode_danmu,
                                 platform: platform.as_str().to_string(),
-                                room_id,
+                                room_id: room_id.clone(),
                                 parent_id,
                                 selected_live_ids: None,
                                 output_name: None,
@@ -540,6 +580,12 @@ impl RecorderManager {
                             None,
                         )
                         .await;
+                    // Keep the durable recovery marker throughout generation.
+                    // A container restart or failed FFmpeg task will therefore
+                    // retry the whole-session export on the next startup.
+                    self_clone
+                        .acknowledge_douyin_live_end(platform, &room_id, &ended_session_id)
+                        .await;
                     Ok(())
                 },
             ))
@@ -552,6 +598,24 @@ impl RecorderManager {
                 .db
                 .update_task(&enqueue_failure_task_id, "failed", &message, None)
                 .await;
+            return;
+        }
+    }
+
+    async fn acknowledge_douyin_live_end(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+        session_id: &str,
+    ) {
+        if platform != PlatformType::Douyin {
+            return;
+        }
+        let cache_dir = PathBuf::from(&self.config.read().await.cache);
+        if !acknowledge_live_end(&cache_dir, room_id, session_id).await {
+            log::warn!(
+                "Douyin whole-session completion did not clear the matching recovery marker"
+            );
         }
     }
 
@@ -666,18 +730,29 @@ impl RecorderManager {
                 )
                 .await?,
             ),
-            PlatformType::Douyin => RecorderType::Douyin(
-                DouyinRecorder::new(
-                    room_id,
-                    extra,
-                    account,
-                    cache_dir,
-                    event_tx,
-                    update_interval,
-                    enabled,
+            PlatformType::Douyin => {
+                // High-volume realtime danmu must not share the lifecycle
+                // channel used for RecordStart/RecordEnd/LiveEnd. A burst over
+                // the broadcast capacity could otherwise drop the LiveEnd that
+                // schedules automatic whole-session generation.
+                let realtime_emitter = self.emitter.clone();
+                let realtime_event_sink = Arc::new(move |event: RecorderEvent| {
+                    realtime_emitter.emit(&event);
+                });
+                RecorderType::Douyin(
+                    DouyinRecorder::new(
+                        room_id,
+                        extra,
+                        account,
+                        cache_dir,
+                        event_tx,
+                        realtime_event_sink,
+                        update_interval,
+                        enabled,
+                    )
+                    .await?,
                 )
-                .await?,
-            ),
+            }
             PlatformType::Huya => RecorderType::Huya(
                 HuyaRecorder::new(
                     room_id,
@@ -728,9 +803,9 @@ impl RecorderManager {
     }
 
     pub async fn stop_all(&self) {
-        for recorder_ref in self.recorders.read().await.values() {
-            recorder_ref.stop().await;
-        }
+        let recorders = self.recorders.read().await;
+        futures::future::join_all(recorders.values().map(|recorder| recorder.stop())).await;
+        drop(recorders);
 
         // remove all recorders
         self.recorders.write().await.clear();
@@ -951,11 +1026,7 @@ impl RecorderManager {
             }
             danmus_path = legacy_path;
         }
-        let Some(storage) = DanmuStorage::new(&danmus_path).await else {
-            log::error!("Failed to load danmu storage: {danmus_path:?}");
-            return Ok(Vec::new());
-        };
-        Ok(storage.get_entries(0).await)
+        Ok(DanmuStorage::read_entries(&danmus_path, 0).await)
     }
 
     /// Load danmu timestamps relative to the first recorded media segment.
@@ -1010,11 +1081,7 @@ impl RecorderManager {
             }
             events_path = legacy_path;
         }
-        let Some(storage) = DanmuStorage::new(&events_path).await else {
-            log::error!("Failed to load complete danmu events: {events_path:?}");
-            return Ok(Vec::new());
-        };
-        Ok(storage.get_events().await)
+        Ok(DanmuStorage::read_events(&events_path).await)
     }
 
     /// Get related playlists by parent id
@@ -1026,44 +1093,61 @@ impl RecorderManager {
         platform: &PlatformType,
         room_id: &str,
         parent_id: &str,
-    ) -> Vec<RelatedPlaylist> {
+    ) -> Result<Vec<RelatedPlaylist>, RecorderManagerError> {
         let cache_path = self.config.read().await.cache.clone();
         let cache_path = Path::new(&cache_path);
-        let archives = self.db.get_archives_by_parent_id(room_id, parent_id).await;
-        if let Err(e) = archives {
-            log::error!(
-                "[{}] Failed to get all related playlists: {} {}",
-                room_id,
-                parent_id,
-                e
-            );
-            return Vec::new();
+        let mut archives = self
+            .db
+            .get_archives_by_parent_id(room_id, parent_id)
+            .await?;
+        archives.retain(|archive| archive.platform == platform.as_str());
+        // Rebuilt rows receive a fresh created_at in directory iteration order,
+        // which is not chronological. Douyin attempt IDs are epoch millis, so
+        // prefer their numeric order and use the DB timestamp as a fallback.
+        if *platform == PlatformType::Douyin
+            && archives
+                .iter()
+                .all(|archive| archive.live_id.parse::<i128>().is_ok())
+        {
+            archives.sort_by_key(|archive| archive.live_id.parse::<i128>().unwrap_or_default());
+        } else {
+            archives.sort_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.live_id.cmp(&right.live_id))
+            });
         }
 
-        let archives: Vec<(String, String)> = archives
-            .unwrap()
-            .iter()
-            .filter(|archive| archive.platform == platform.as_str())
-            .map(|a| (a.title.clone(), a.live_id.clone()))
-            .collect();
-
-        let playlists = archives
-            .iter()
-            .map(async |a| {
-                let work_dir =
-                    CachePath::new(cache_path.to_path_buf(), *platform, room_id, a.1.as_str());
-
-                RelatedPlaylist {
-                    live_id: a.1.clone(),
-                    title: a.0.clone(),
-                    path: work_dir.with_filename("playlist.m3u8").full_path(),
+        let mut playlists = Vec::with_capacity(archives.len());
+        for archive in archives {
+            let work_dir = CachePath::new(
+                cache_path.to_path_buf(),
+                *platform,
+                room_id,
+                archive.live_id.as_str(),
+            );
+            let playlist_path = work_dir.with_filename("playlist.m3u8").full_path();
+            if archive.size <= 0 {
+                let has_playlist = tokio::fs::metadata(&playlist_path)
+                    .await
+                    .map(|metadata| metadata.is_file() && metadata.len() > 0)
+                    .unwrap_or(false);
+                if !has_playlist {
+                    log::warn!(
+                        "Skipping empty recording attempt {} from whole-session generation",
+                        archive.live_id
+                    );
+                    continue;
                 }
-            })
-            .collect::<Vec<_>>();
+            }
+            playlists.push(RelatedPlaylist {
+                live_id: archive.live_id,
+                title: archive.title,
+                path: playlist_path,
+            });
+        }
 
-        let playlists = futures::future::join_all(playlists).await;
-
-        playlists
+        Ok(playlists)
     }
 
     pub async fn clip_range(
@@ -1673,7 +1757,7 @@ impl RecorderManager {
 
         let mut playlists = self
             .get_related_playlists(&platform, &room_id, &parent_id)
-            .await;
+            .await?;
         if playlists.is_empty() {
             log::error!("No related playlists found: {parent_id}");
             return Err(RecorderManagerError::EmptyPlaylist);
@@ -1702,17 +1786,22 @@ impl RecorderManager {
 
         // generate archive danmu ass file for all playlists
         let danmu_ass_files = if encode_danmu {
-            let danmu_ass_files = playlists
+            let live_ids = playlists
+                .iter()
+                .map(|playlist| playlist.live_id.clone())
+                .collect::<Vec<_>>();
+            let danmu_ass_results = playlists
                 .iter()
                 .map(async |p| {
-                    (self
-                        .generate_archive_danmu_ass(platform, &room_id, &p.live_id)
-                        .await)
-                        .ok()
+                    self.generate_archive_danmu_ass(platform, &room_id, &p.live_id)
+                        .await
                 })
                 .collect::<Vec<_>>();
 
-            futures::future::join_all(danmu_ass_files).await
+            require_danmu_ass_files(
+                &live_ids,
+                futures::future::join_all(danmu_ass_results).await,
+            )?
         } else {
             vec![None; playlists.len()]
         };
@@ -1763,7 +1852,7 @@ impl RecorderManager {
             log::error!("Failed to concat playlists: {e}");
             let _ = tokio::fs::remove_file(&output_path).await;
             return Err(RecorderManagerError::HLSError {
-                err: "Failed to concat playlists".into(),
+                err: format!("Failed to concat playlists: {e}"),
             });
         }
 
@@ -1993,5 +2082,26 @@ mod live_end_tests {
             .unwrap(),
             Some("session-1".into())
         );
+    }
+
+    #[test]
+    fn required_danmu_ass_failure_is_not_downgraded_to_none() {
+        let live_ids = vec![
+            "douyin-segment-1".to_string(),
+            "douyin-segment-2".to_string(),
+        ];
+        let results = vec![
+            Ok(PathBuf::from("segment-1.ass")),
+            Err(RecorderManagerError::InvalidLiveID),
+        ];
+
+        let error = require_danmu_ass_files(&live_ids, results).unwrap_err();
+        match error {
+            RecorderManagerError::ArchiveDanmuAssGenerationFailed { error } => {
+                assert!(error.contains("douyin-segment-2"));
+                assert!(error.contains("Invalid live id"));
+            }
+            error => panic!("unexpected error: {error}"),
+        }
     }
 }

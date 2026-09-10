@@ -32,6 +32,10 @@ pub enum DanmuMessageType {
     Event(LiveEvent),
     /// Kept for providers which have not yet migrated to `Event`.
     DanmuMessage(DanmuMessage),
+    /// A provider-side durability barrier. The consumer acknowledges it only
+    /// after all preceding events have been persisted. Douyin uses this before
+    /// ACKing a websocket frame so a process crash can be replayed safely.
+    PersistBarrier(tokio::sync::oneshot::Sender<Result<(), String>>),
 }
 
 /// The on-disk/websocket-independent representation of a live-room event.

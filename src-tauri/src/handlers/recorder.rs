@@ -52,18 +52,21 @@ pub async fn add_recorder(
             }
         }
         PlatformType::Douyin => {
+            let account = state
+                .db
+                .get_account_by_platform("douyin")
+                .await
+                .map_err(|_| {
+                    log::error!("No available douyin account found");
+                    "没有可用账号，请先添加账号".to_string()
+                })?
+                .to_account();
             let client = reqwest::Client::new();
-            let sec_uid = douyin::api::get_room_owner_sec_uid(&client, &room_id)
+            let sec_uid = douyin::api::get_room_owner_sec_uid(&client, &account, &room_id)
                 .await
                 .map_err(|e| e.to_string())?;
             extra = sec_uid;
-
-            if let Ok(account) = state.db.get_account_by_platform("douyin").await {
-                Ok(account.to_account())
-            } else {
-                log::error!("No available douyin account found");
-                Err("没有可用账号，请先添加账号".to_string())
-            }
+            Ok(account)
         }
         PlatformType::Huya => {
             if let Ok(account) = state.db.get_account_by_platform("huya").await {
@@ -401,15 +404,64 @@ fn full_danmu_export_entry(event: &LiveEvent) -> Value {
     })
 }
 
+pub(crate) fn export_full_danmu_event(event: &LiveEvent) -> Result<Option<String>, String> {
+    if event.event_type != "danmu" {
+        return Ok(None);
+    }
+
+    serde_json::to_string(&full_danmu_export_entry(event))
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// Convert one persisted danmu record into the flattened JSONL format used by
+/// downloads. New recordings contain a serialized `LiveEvent`; the fallback
+/// keeps old `timestamp:content` recordings downloadable without pretending
+/// that metadata which was never recorded can be reconstructed.
+pub(crate) fn export_persisted_danmu_line(
+    line: &str,
+    platform: &str,
+    room_id: &str,
+) -> Result<Option<String>, String> {
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let event = match serde_json::from_str::<LiveEvent>(line) {
+        Ok(event) => event,
+        Err(json_error) => {
+            let Some((ts, content)) = line.split_once(':') else {
+                return Err(format!("Invalid persisted danmu event: {json_error}"));
+            };
+            let ts = ts
+                .parse::<i64>()
+                .map_err(|_| format!("Invalid persisted danmu event: {json_error}"))?;
+            LiveEvent {
+                ts,
+                platform: platform.to_string(),
+                room_id: room_id.to_string(),
+                event_type: "danmu".to_string(),
+                data: json!({ "content": content }),
+                raw: Value::Null,
+            }
+        }
+    };
+
+    export_full_danmu_event(&event)
+}
+
 fn export_full_danmu_jsonl(events: &[LiveEvent]) -> Result<String, String> {
-    events
-        .iter()
-        .filter(|event| event.event_type == "danmu")
-        .map(|event| {
-            serde_json::to_string(&full_danmu_export_entry(event)).map_err(|e| e.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|lines| lines.join("\n"))
+    let mut output = String::new();
+    for event in events {
+        let Some(line) = export_full_danmu_event(event)? else {
+            continue;
+        };
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&line);
+    }
+    Ok(output)
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
@@ -530,6 +582,62 @@ mod export_danmu_tests {
         };
 
         assert!(export_full_danmu_jsonl(&[event]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn persisted_line_export_flattens_raw_douyin_event_without_losing_fields() {
+        let event = LiveEvent {
+            ts: 1_788_868_414_771,
+            platform: "douyin".to_string(),
+            room_id: "123".to_string(),
+            event_type: "danmu".to_string(),
+            data: json!({ "content": "终于能播了" }),
+            raw: json!({
+                "id": "7683131321120630299",
+                "method": "WebcastChatMessage",
+                "user": {
+                    "id": "MS4w.test",
+                    "shortId": "2988955578",
+                    "displayId": "dyr8cty6m73n",
+                    "name": "枯枝邀明月",
+                    "gender": 1,
+                    "avatar": "https://example.com/avatar.jpeg",
+                    "currentTargetAnchorId": "105460512869",
+                    "fansClub": [{ "anchorId": "105460512869", "level": 9 }]
+                },
+                "content": "终于能播了",
+                "time": 1_788_868_414_771_i64,
+                "payloadHex": "0102"
+            }),
+        };
+        let persisted = serde_json::to_string(&event).unwrap();
+
+        let output = export_persisted_danmu_line(&persisted, "douyin", "123")
+            .unwrap()
+            .unwrap();
+        let exported: Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(exported, event.raw);
+        assert!(exported.get("raw").is_none());
+        assert!(exported.get("data").is_none());
+    }
+
+    #[test]
+    fn persisted_line_export_supports_legacy_timestamp_content() {
+        let output = export_persisted_danmu_line("1234:包含:冒号", "douyin", "5678")
+            .unwrap()
+            .unwrap();
+        let exported: Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(exported["time"], 1234);
+        assert_eq!(exported["platform"], "douyin");
+        assert_eq!(exported["roomId"], "5678");
+        assert_eq!(exported["content"], "包含:冒号");
+    }
+
+    #[test]
+    fn persisted_line_export_rejects_corrupt_records() {
+        assert!(export_persisted_danmu_line("not-json", "douyin", "123").is_err());
     }
 }
 

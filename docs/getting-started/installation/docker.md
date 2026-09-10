@@ -33,7 +33,7 @@ ghcr.io/smathsp/bili-shadowreplay:latest
 如需固定版本，可在启动前设置 `BILI_SHADOWREPLAY_IMAGE`，例如：
 
 ```bash
-export BILI_SHADOWREPLAY_IMAGE=ghcr.io/smathsp/bili-shadowreplay:2.22.3
+export BILI_SHADOWREPLAY_IMAGE=ghcr.io/smathsp/bili-shadowreplay:2.22.4
 docker compose -f docker_compose.yaml up -d
 ```
 

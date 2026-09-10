@@ -85,10 +85,7 @@ impl DanmuProvider for KuaishouDanmu {
         })
     }
 
-    async fn start(
-        &self,
-        tx: mpsc::UnboundedSender<DanmuMessageType>,
-    ) -> Result<(), DanmuStreamError> {
+    async fn start(&self, tx: mpsc::Sender<DanmuMessageType>) -> Result<(), DanmuStreamError> {
         let mut retry_count = 0;
         const RETRY_DELAY: Duration = Duration::from_secs(5);
         info!(
@@ -148,7 +145,7 @@ impl DanmuProvider for KuaishouDanmu {
 impl KuaishouDanmu {
     async fn connect_and_handle(
         &self,
-        tx: mpsc::UnboundedSender<DanmuMessageType>,
+        tx: mpsc::Sender<DanmuMessageType>,
     ) -> Result<(), DanmuStreamError> {
         let room_init = self.room_init().await?;
         let ws_url = room_init
@@ -246,7 +243,7 @@ impl KuaishouDanmu {
 
     async fn recv(
         mut read: WsReadType,
-        tx: mpsc::UnboundedSender<DanmuMessageType>,
+        tx: mpsc::Sender<DanmuMessageType>,
         room_id: String,
         stop: Arc<RwLock<bool>>,
     ) -> Result<(), DanmuStreamError> {
@@ -299,6 +296,7 @@ impl KuaishouDanmu {
                         timestamp: ts,
                     };
                     tx.send(DanmuMessageType::DanmuMessage(danmu))
+                        .await
                         .map_err(|e| DanmuStreamError::WebsocketError { err: e.to_string() })?;
                 }
                 for gift in feed.gift_feeds {
@@ -334,6 +332,7 @@ impl KuaishouDanmu {
                         "payload_hex": hex::encode(&payload),
                     }));
                     tx.send(DanmuMessageType::Event(event))
+                        .await
                         .map_err(|e| DanmuStreamError::WebsocketError { err: e.to_string() })?;
                 }
                 if feed.pending_like_count > 0 {
@@ -349,6 +348,7 @@ impl KuaishouDanmu {
                         "payload_hex": hex::encode(&payload),
                     }));
                     tx.send(DanmuMessageType::Event(event))
+                        .await
                         .map_err(|e| DanmuStreamError::WebsocketError { err: e.to_string() })?;
                 }
             }

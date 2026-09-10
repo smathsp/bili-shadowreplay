@@ -593,6 +593,22 @@ async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Err
     let mut task_manager = TaskManager::new();
     task_manager.start();
     let task_manager = Arc::new(task_manager);
+    // Reconcile archives before recorder monitoring starts. In Docker this
+    // prevents a recovered Douyin LiveEnd from racing crash cleanup and
+    // scheduling a whole-session task against stale/missing playlists.
+    try_rebuild_archives(&db, config.read().await.cache.clone().into()).await?;
+    if let Err(error) = try_convert_live_covers(&db, config.read().await.cache.clone().into()).await
+    {
+        log::warn!("Converting archived live covers failed: {error}");
+    }
+    if let Err(error) =
+        try_convert_clip_covers(&db, config.read().await.output.clone().into()).await
+    {
+        log::warn!("Converting clip covers failed: {error}");
+    }
+    try_add_parent_id_to_records(&db).await?;
+    try_convert_entry_to_m3u8(&db, config.read().await.cache.clone().into()).await?;
+
     let recorder_manager = Arc::new(RecorderManager::new(
         emitter,
         db.clone(),
@@ -601,12 +617,6 @@ async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Err
         resource_dir.clone(),
         webhook_poster.clone(),
     ));
-
-    let _ = try_rebuild_archives(&db, config.read().await.cache.clone().into()).await;
-    let _ = try_convert_live_covers(&db, config.read().await.cache.clone().into()).await;
-    let _ = try_convert_clip_covers(&db, config.read().await.output.clone().into()).await;
-    let _ = try_add_parent_id_to_records(&db).await;
-    let _ = try_convert_entry_to_m3u8(&db, config.read().await.cache.clone().into()).await;
 
     Ok(State {
         db,
@@ -671,6 +681,19 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
 
     let task_manager = Arc::new(task_manager);
 
+    // try to rebuild archive table
+    let cache_path = config_clone.read().await.cache.clone();
+    let output_path = config_clone.read().await.output.clone();
+    try_rebuild_archives(&db_clone, cache_path.clone().into()).await?;
+    if let Err(error) = try_convert_live_covers(&db_clone, cache_path.clone().into()).await {
+        log::warn!("Converting archived live covers failed: {error}");
+    }
+    if let Err(error) = try_convert_clip_covers(&db_clone, output_path.clone().into()).await {
+        log::warn!("Converting clip covers failed: {error}");
+    }
+    try_add_parent_id_to_records(&db_clone).await?;
+    try_convert_entry_to_m3u8(&db_clone, cache_path.clone().into()).await?;
+
     let recorder_manager = Arc::new(RecorderManager::new(
         app.app_handle().clone(),
         emitter,
@@ -682,17 +705,6 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
     ));
 
     let static_server = Arc::new(start_static_server(config.clone()).await?);
-
-    // try to rebuild archive table
-    let cache_path = config_clone.read().await.cache.clone();
-    let output_path = config_clone.read().await.output.clone();
-    if let Err(e) = try_rebuild_archives(&db_clone, cache_path.clone().into()).await {
-        log::warn!("Rebuilding archive table failed: {e}");
-    }
-    let _ = try_convert_live_covers(&db_clone, cache_path.clone().into()).await;
-    let _ = try_convert_clip_covers(&db_clone, output_path.clone().into()).await;
-    let _ = try_add_parent_id_to_records(&db_clone).await;
-    let _ = try_convert_entry_to_m3u8(&db_clone, cache_path.clone().into()).await;
 
     Ok(State {
         db,

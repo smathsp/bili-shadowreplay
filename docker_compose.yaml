@@ -4,7 +4,8 @@ services:
   bili-shadowreplay:
     image: ${BILI_SHADOWREPLAY_IMAGE:-ghcr.io/smathsp/bili-shadowreplay:latest}
     restart: unless-stopped
-    stop_grace_period: 30s
+    # Allows the bounded Douyin queue to drain and sync before Docker sends SIGKILL.
+    stop_grace_period: 60s
     ports:
       # The Web API has no built-in authentication, so keep it local by default.
       # Set BSR_BIND_ADDRESS=0.0.0.0 only for a trusted LAN or an authenticated proxy.

@@ -2,7 +2,7 @@ mod messages;
 
 use std::io::Read;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use deno_core::v8;
@@ -19,7 +19,13 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio_tungstenite::{
-    connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
+    connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        http::{header, HeaderValue, Request},
+        Message as WsMessage,
+    },
+    MaybeTlsStream, WebSocketStream,
 };
 
 use crate::{provider::DanmuProvider, DanmuMessageType, DanmuStreamError, LiveEvent};
@@ -28,6 +34,8 @@ use serde_json::json;
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const WEBSOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const HEARTBEAT_PAYLOAD: &[u8] = &[0x3A, 0x02, 0x68, 0x62];
 
 type WsReadType = futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 type WsWriteType =
@@ -41,52 +49,39 @@ pub struct DouyinDanmu {
 }
 
 impl DouyinDanmu {
+    fn websocket_request(&self, url: &str) -> Result<Request<()>, DanmuStreamError> {
+        // Let tungstenite generate the Host and WebSocket handshake headers from
+        // the signed URL. Douyin currently returns an `-lf` host; hard-coding an
+        // `-hl` Host header makes the HTTP host disagree with both the URL and
+        // TLS SNI and can cause intermittent handshake failures.
+        let mut request =
+            url.into_client_request()
+                .map_err(|error| DanmuStreamError::WebsocketError {
+                    err: format!("Failed to build douyin websocket request: {error}"),
+                })?;
+        let headers = request.headers_mut();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&self.cookie).map_err(|error| {
+                DanmuStreamError::WebsocketError {
+                    err: format!("Invalid douyin cookie header: {error}"),
+                }
+            })?,
+        );
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("https://live.douyin.com/"),
+        );
+        headers.insert(header::USER_AGENT, HeaderValue::from_static(USER_AGENT));
+        Ok(request)
+    }
+
     async fn connect_and_handle(
         &self,
-        tx: mpsc::UnboundedSender<DanmuMessageType>,
+        tx: mpsc::Sender<DanmuMessageType>,
     ) -> Result<(), DanmuStreamError> {
         let url = self.get_wss_url().await?;
-
-        let request = tokio_tungstenite::tungstenite::http::Request::builder()
-            .uri(url)
-            .header(
-                tokio_tungstenite::tungstenite::http::header::COOKIE,
-                self.cookie.as_str(),
-            )
-            .header(
-                tokio_tungstenite::tungstenite::http::header::REFERER,
-                "https://live.douyin.com/",
-            )
-            .header(
-                tokio_tungstenite::tungstenite::http::header::USER_AGENT,
-                USER_AGENT,
-            )
-            .header(
-                tokio_tungstenite::tungstenite::http::header::HOST,
-                "webcast5-ws-web-hl.douyin.com",
-            )
-            .header(
-                tokio_tungstenite::tungstenite::http::header::UPGRADE,
-                "websocket",
-            )
-            .header(
-                tokio_tungstenite::tungstenite::http::header::CONNECTION,
-                "Upgrade",
-            )
-            .header(
-                tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_VERSION,
-                "13",
-            )
-            .header(
-                tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_EXTENSIONS,
-                "permessage-deflate; client_max_window_bits",
-            )
-            .header(
-                tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_KEY,
-                "V1Yza5x1zcfkembl6u/0Pg==",
-            )
-            .body(())
-            .unwrap();
+        let request = self.websocket_request(&url)?;
 
         let (ws_stream, response) =
             connect_async(request)
@@ -100,7 +95,9 @@ impl DouyinDanmu {
 
         let (write, read) = ws_stream.split();
         *self.write.write().await = Some(write);
-        self.handle_connection(read, tx).await
+        let result = self.handle_connection(read, tx).await;
+        *self.write.write().await = None;
+        result
     }
 
     async fn get_wss_url(&self) -> Result<String, DanmuStreamError> {
@@ -147,107 +144,77 @@ impl DouyinDanmu {
     async fn handle_connection(
         &self,
         mut read: WsReadType,
-        tx: mpsc::UnboundedSender<DanmuMessageType>,
+        tx: mpsc::Sender<DanmuMessageType>,
     ) -> Result<(), DanmuStreamError> {
-        // Start heartbeat task with error handling
-        let (tx_write, mut _rx_write) = mpsc::channel(32);
-        let tx_write_clone = tx_write.clone();
-        let stop = Arc::clone(&self.stop);
-        let heartbeat_handle = tokio::spawn(async move {
-            let mut last_heartbeat = SystemTime::now();
-            let mut consecutive_failures = 0;
-            const MAX_FAILURES: u32 = 3;
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `interval` ticks immediately once. Consume that tick so the first
+        // heartbeat is sent after the configured interval.
+        heartbeat.tick().await;
 
-            loop {
-                if *stop.read().await {
-                    log::info!("Stopping douyin danmu stream");
-                    break;
-                }
-
-                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-
-                match Self::send_heartbeat(&tx_write_clone).await {
-                    Ok(_) => {
-                        last_heartbeat = SystemTime::now();
-                        consecutive_failures = 0;
-                    }
-                    Err(e) => {
-                        error!("Failed to send heartbeat: {}", e);
-                        consecutive_failures += 1;
-
-                        if consecutive_failures >= MAX_FAILURES {
-                            error!("Too many consecutive heartbeat failures, closing connection");
-                            break;
-                        }
-
-                        // Check if we've exceeded the maximum time without a successful heartbeat
-                        if let Ok(duration) = last_heartbeat.elapsed() {
-                            if duration > HEARTBEAT_INTERVAL * 2 {
-                                error!("No successful heartbeat for too long, closing connection");
-                                break;
-                            }
-                        }
-                    }
-                }
+        loop {
+            if *self.stop.read().await {
+                info!("Stopping douyin danmu stream");
+                break;
             }
-        });
-
-        // Main message handling loop
-        let room_id = self.room_id.clone();
-        let stop = Arc::clone(&self.stop);
-        let write = Arc::clone(&self.write);
-        let message_handle = tokio::spawn(async move {
-            while let Some(msg) =
-                read.try_next()
-                    .await
-                    .map_err(|e| DanmuStreamError::WebsocketError {
-                        err: format!("Failed to read message: {}", e),
-                    })?
-            {
-                if *stop.read().await {
-                    log::info!("Stopping douyin danmu stream");
-                    break;
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    if *self.stop.read().await {
+                        info!("Stopping douyin danmu stream");
+                        break;
+                    }
+                    self.send_ws_message(Self::heartbeat_message(), "heartbeat").await?;
                 }
+                message = read.try_next() => {
+                    let Some(message) = message.map_err(|error| {
+                        DanmuStreamError::WebsocketError {
+                            err: format!("Failed to read message: {error}"),
+                        }
+                    })? else {
+                        info!("Douyin WebSocket stream ended");
+                        break;
+                    };
 
-                match msg {
-                    WsMessage::Binary(data) => {
-                        if let Ok(Some(ack)) = handle_binary_message(&data, &tx, &room_id).await {
-                            if let Some(write) = write.write().await.as_mut() {
-                                if let Err(e) =
-                                    write.send(WsMessage::binary(ack.encode_to_vec())).await
-                                {
-                                    error!("Failed to send ack: {}", e);
+                    match message {
+                        WsMessage::Binary(data) => {
+                            let (ack, events) = decode_binary_message(&data, &self.room_id)?;
+                            // Hand every decoded event to the bounded recorder
+                            // queue before acknowledging the frame. During
+                            // backpressure `forward_event` keeps the connection
+                            // alive with heartbeats, and a crash leaves the frame
+                            // unacknowledged so Douyin may replay it on reconnect.
+                            let has_events = !events.is_empty();
+                            for event in events {
+                                self.forward_event(&tx, event, &mut heartbeat).await?;
+                            }
+                            if ack.is_some() && has_events {
+                                self.wait_for_persistence(&tx, &mut heartbeat).await?;
+                            }
+                            if let Some(ack) = ack {
+                                if *self.stop.read().await {
+                                    // The frame was already received before
+                                    // shutdown. Persist it, but do not ACK a
+                                    // connection which is being closed.
+                                    info!("Stopping douyin danmu stream after final frame");
+                                    break;
+                                } else {
+                                    self.send_ws_message(
+                                        WsMessage::binary(ack.encode_to_vec()),
+                                        "ack",
+                                    )
+                                    .await?;
                                 }
                             }
                         }
-                    }
-                    WsMessage::Close(_) => {
-                        info!("WebSocket connection closed");
-                        break;
-                    }
-                    WsMessage::Ping(data) => {
-                        // Respond to ping with pong
-                        if let Err(e) = tx_write.send(WsMessage::Pong(data)).await {
-                            error!("Failed to send pong: {}", e);
+                        WsMessage::Close(_) => {
+                            info!("WebSocket connection closed");
                             break;
                         }
+                        WsMessage::Ping(data) => {
+                            self.send_ws_message(WsMessage::Pong(data), "pong").await?;
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            }
-            Ok::<(), DanmuStreamError>(())
-        });
-
-        // Wait for either the heartbeat or message handling to complete
-        tokio::select! {
-            result = heartbeat_handle => {
-                if let Err(e) = result {
-                    error!("Heartbeat task failed: {}", e);
-                }
-            }
-            result = message_handle => {
-                if let Err(e) = result {
-                    error!("Message handling task failed: {}", e);
                 }
             }
         }
@@ -255,22 +222,101 @@ impl DouyinDanmu {
         Ok(())
     }
 
-    async fn send_heartbeat(tx: &mpsc::Sender<WsMessage>) -> Result<(), DanmuStreamError> {
-        // heartbeat message: 3A 02 68 62
-        tx.send(WsMessage::binary(vec![0x3A, 0x02, 0x68, 0x62]))
-            .await
-            .map_err(|e| DanmuStreamError::WebsocketError {
-                err: format!("Failed to send heartbeat message: {}", e),
+    fn heartbeat_message() -> WsMessage {
+        WsMessage::binary(HEARTBEAT_PAYLOAD.to_vec())
+    }
+
+    async fn send_ws_message(
+        &self,
+        message: WsMessage,
+        message_type: &str,
+    ) -> Result<(), DanmuStreamError> {
+        let mut write = self.write.write().await;
+        let write = write
+            .as_mut()
+            .ok_or_else(|| DanmuStreamError::WebsocketError {
+                err: format!("Cannot send douyin {message_type}: websocket writer is unavailable"),
             })?;
-        Ok(())
+        match tokio::time::timeout(WEBSOCKET_WRITE_TIMEOUT, write.send(message)).await {
+            Ok(result) => result.map_err(|error| DanmuStreamError::WebsocketError {
+                err: format!("Failed to send douyin {message_type}: {error}"),
+            }),
+            Err(_) => Err(DanmuStreamError::WebsocketError {
+                err: format!(
+                    "Timed out sending douyin {message_type} after {} seconds",
+                    WEBSOCKET_WRITE_TIMEOUT.as_secs()
+                ),
+            }),
+        }
+    }
+
+    async fn forward_event(
+        &self,
+        tx: &mpsc::Sender<DanmuMessageType>,
+        event: DanmuMessageType,
+        heartbeat: &mut tokio::time::Interval,
+    ) -> Result<(), DanmuStreamError> {
+        let send = tx.send(event);
+        tokio::pin!(send);
+        loop {
+            tokio::select! {
+                result = &mut send => {
+                    return result.map_err(|error| DanmuStreamError::WebsocketError {
+                        err: format!("Failed to send message to channel: {error}"),
+                    });
+                }
+                _ = heartbeat.tick() => {
+                    // Once graceful shutdown starts, keep waiting for recorder
+                    // capacity instead of failing this accepted event merely
+                    // because the websocket writer was closed by `stop`.
+                    if !*self.stop.read().await {
+                        self.send_ws_message(Self::heartbeat_message(), "heartbeat").await?;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn wait_for_persistence(
+        &self,
+        tx: &mpsc::Sender<DanmuMessageType>,
+        heartbeat: &mut tokio::time::Interval,
+    ) -> Result<(), DanmuStreamError> {
+        let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
+        self.forward_event(
+            tx,
+            DanmuMessageType::PersistBarrier(persisted_tx),
+            heartbeat,
+        )
+        .await?;
+        tokio::pin!(persisted_rx);
+        loop {
+            tokio::select! {
+                result = &mut persisted_rx => {
+                    return match result {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(error)) => Err(DanmuStreamError::WebsocketError {
+                            err: format!("Douyin event persistence failed before ACK: {error}"),
+                        }),
+                        Err(error) => Err(DanmuStreamError::WebsocketError {
+                            err: format!("Douyin persistence barrier was dropped before ACK: {error}"),
+                        }),
+                    };
+                }
+                _ = heartbeat.tick() => {
+                    if !*self.stop.read().await {
+                        self.send_ws_message(Self::heartbeat_message(), "heartbeat").await?;
+                    }
+                }
+            }
+        }
     }
 }
 
-async fn handle_binary_message(
+fn decode_binary_message(
     data: &[u8],
-    tx: &mpsc::UnboundedSender<DanmuMessageType>,
     room_id: &str,
-) -> Result<Option<PushFrame>, DanmuStreamError> {
+) -> Result<(Option<PushFrame>, Vec<DanmuMessageType>), DanmuStreamError> {
     // First decode the PushFrame
     let push_frame = PushFrame::decode(Bytes::from(data.to_vec())).map_err(|e| {
         DanmuStreamError::WebsocketError {
@@ -294,39 +340,19 @@ async fn handle_binary_message(
         }
     })?;
 
-    // if payload_package.needAck:
-    // obj = PushFrame()
-    // obj.payloadType = 'ack'
-    // obj.logId = log_id
-    // obj.payloadType = payload_package.internalExt
-    // ack = obj.SerializeToString()
-    let mut ack = None;
-    if response.need_ack {
-        let ack_msg = PushFrame {
-            payload_type: "ack".to_string(),
-            log_id: push_frame.log_id,
-            payload_encoding: "".to_string(),
-            payload: vec![],
-            seq_id: 0,
-            service: 0,
-            method: 0,
-            headers_list: vec![],
-        };
-
-        debug!("Need to respond ack: {:?}", ack_msg);
-
-        ack = Some(ack_msg);
-    }
+    let ack = build_ack(&push_frame, &response);
+    let mut events = Vec::new();
 
     for message in response.messages_list {
         match message.method.as_str() {
             "WebcastChatMessage" => {
-                let chat_msg =
-                    DouyinChatMessage::decode(message.payload.as_slice()).map_err(|e| {
-                        DanmuStreamError::WebsocketError {
-                            err: format!("Failed to decode chat message: {}", e),
-                        }
-                    })?;
+                let chat_msg = match DouyinChatMessage::decode(message.payload.as_slice()) {
+                    Ok(chat_msg) => chat_msg,
+                    Err(error) => {
+                        error!("Skipping malformed Douyin chat message: {error}");
+                        continue;
+                    }
+                };
                 let event = douyin_chat_event(
                     room_id,
                     &message.method,
@@ -335,18 +361,16 @@ async fn handle_binary_message(
                     chat_msg,
                 );
                 debug!("Received danmu event: {:?}", event);
-                tx.send(DanmuMessageType::Event(event)).map_err(|e| {
-                    DanmuStreamError::WebsocketError {
-                        err: format!("Failed to send message to channel: {}", e),
-                    }
-                })?;
+                events.push(DanmuMessageType::Event(event));
             }
             "WebcastGiftMessage" => {
-                let gift_msg = GiftMessage::decode(message.payload.as_slice()).map_err(|e| {
-                    DanmuStreamError::WebsocketError {
-                        err: format!("Failed to decode gift message: {}", e),
+                let gift_msg = match GiftMessage::decode(message.payload.as_slice()) {
+                    Ok(gift_msg) => gift_msg,
+                    Err(error) => {
+                        error!("Skipping malformed Douyin gift message: {error}");
+                        continue;
                     }
-                })?;
+                };
                 if let Some(user) = gift_msg.user {
                     if let Some(gift) = gift_msg.gift {
                         log::debug!("Received gift: {} from user: {}", gift.name, user.nick_name);
@@ -366,20 +390,18 @@ async fn handle_binary_message(
                             "method": "WebcastGiftMessage",
                             "payload_hex": hex::encode(&message.payload),
                         }));
-                        tx.send(DanmuMessageType::Event(event)).map_err(|e| {
-                            DanmuStreamError::WebsocketError {
-                                err: format!("Failed to send gift event: {}", e),
-                            }
-                        })?;
+                        events.push(DanmuMessageType::Event(event));
                     }
                 }
             }
             "WebcastLikeMessage" => {
-                let like_msg = LikeMessage::decode(message.payload.as_slice()).map_err(|e| {
-                    DanmuStreamError::WebsocketError {
-                        err: format!("Failed to decode like message: {}", e),
+                let like_msg = match LikeMessage::decode(message.payload.as_slice()) {
+                    Ok(like_msg) => like_msg,
+                    Err(error) => {
+                        error!("Skipping malformed Douyin like message: {error}");
+                        continue;
                     }
-                })?;
+                };
                 if let Some(user) = like_msg.user {
                     log::debug!(
                         "Received {} likes from user: {}",
@@ -401,20 +423,17 @@ async fn handle_binary_message(
                         "method": "WebcastLikeMessage",
                         "payload_hex": hex::encode(&message.payload),
                     }));
-                    tx.send(DanmuMessageType::Event(event)).map_err(|e| {
-                        DanmuStreamError::WebsocketError {
-                            err: format!("Failed to send like event: {}", e),
-                        }
-                    })?;
+                    events.push(DanmuMessageType::Event(event));
                 }
             }
             "WebcastMemberMessage" => {
-                let member_msg =
-                    MemberMessage::decode(message.payload.as_slice()).map_err(|e| {
-                        DanmuStreamError::WebsocketError {
-                            err: format!("Failed to decode member message: {}", e),
-                        }
-                    })?;
+                let member_msg = match MemberMessage::decode(message.payload.as_slice()) {
+                    Ok(member_msg) => member_msg,
+                    Err(error) => {
+                        error!("Skipping malformed Douyin member message: {error}");
+                        continue;
+                    }
+                };
                 if let Some(user) = member_msg.user {
                     log::debug!(
                         "Member joined: {} (Action: {})",
@@ -435,11 +454,7 @@ async fn handle_binary_message(
                         "method": "WebcastMemberMessage",
                         "payload_hex": hex::encode(&message.payload),
                     }));
-                    tx.send(DanmuMessageType::Event(event)).map_err(|e| {
-                        DanmuStreamError::WebsocketError {
-                            err: format!("Failed to send member event: {}", e),
-                        }
-                    })?;
+                    events.push(DanmuMessageType::Event(event));
                 }
             }
             _ => {
@@ -448,7 +463,22 @@ async fn handle_binary_message(
         }
     }
 
-    Ok(ack)
+    Ok((ack, events))
+}
+
+fn build_ack(push_frame: &PushFrame, response: &Response) -> Option<PushFrame> {
+    response.need_ack.then(|| PushFrame {
+        payload_type: "ack".to_string(),
+        log_id: push_frame.log_id,
+        payload_encoding: "".to_string(),
+        // Douyin uses internal_ext as the cursor acknowledged by the client.
+        // Sending an empty payload leaves the webcast service unacknowledged.
+        payload: response.internal_ext.as_bytes().to_vec(),
+        seq_id: 0,
+        service: 0,
+        method: 0,
+        headers_list: vec![],
+    })
 }
 
 fn douyin_timestamp_millis(event_time: u64) -> i64 {
@@ -587,6 +617,71 @@ fn douyin_chat_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write as _;
+
+    fn test_provider(cookie: &str) -> DouyinDanmu {
+        DouyinDanmu {
+            room_id: "123".to_string(),
+            cookie: cookie.to_string(),
+            stop: Arc::new(RwLock::new(false)),
+            write: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    #[test]
+    fn websocket_request_uses_the_signed_url_host() {
+        let provider = test_provider("sessionid=test");
+        let request = provider
+            .websocket_request(
+                "wss://webcast5-ws-web-lf.douyin.com/webcast/im/push/v2/?room_id=123",
+            )
+            .unwrap();
+
+        assert_eq!(
+            request.headers().get(header::HOST).unwrap(),
+            "webcast5-ws-web-lf.douyin.com"
+        );
+        assert_eq!(
+            request.headers().get(header::COOKIE).unwrap(),
+            "sessionid=test"
+        );
+        assert!(request.headers().contains_key(header::SEC_WEBSOCKET_KEY));
+    }
+
+    #[test]
+    fn heartbeat_uses_the_douyin_wire_payload() {
+        assert_eq!(
+            DouyinDanmu::heartbeat_message().into_data().as_ref(),
+            HEARTBEAT_PAYLOAD
+        );
+    }
+
+    #[test]
+    fn ack_carries_internal_extension_cursor() {
+        let push_frame = PushFrame {
+            log_id: 42,
+            ..Default::default()
+        };
+        let response = Response {
+            need_ack: true,
+            internal_ext: "cursor=next".to_string(),
+            ..Default::default()
+        };
+
+        let ack = build_ack(&push_frame, &response).unwrap();
+        assert_eq!(ack.payload_type, "ack");
+        assert_eq!(ack.log_id, 42);
+        assert_eq!(ack.payload, b"cursor=next");
+    }
+
+    #[test]
+    fn ack_is_omitted_when_server_does_not_request_it() {
+        let push_frame = PushFrame::default();
+        let response = Response::default();
+
+        assert!(build_ack(&push_frame, &response).is_none());
+    }
 
     #[test]
     fn creates_complete_chat_event() {
@@ -656,6 +751,49 @@ mod tests {
         );
         assert_eq!(event.ts, 1_788_868_414_000);
     }
+
+    #[test]
+    fn malformed_child_message_does_not_poison_valid_chat_or_frame_ack() {
+        let chat = DouyinChatMessage {
+            content: "valid chat".to_string(),
+            event_time: 1_788_868_414_771,
+            ..Default::default()
+        };
+        let response = Response {
+            messages_list: vec![
+                CommonMessage {
+                    method: "WebcastGiftMessage".to_string(),
+                    payload: vec![0xff],
+                    ..Default::default()
+                },
+                CommonMessage {
+                    method: "WebcastChatMessage".to_string(),
+                    payload: chat.encode_to_vec(),
+                    msg_id: 42,
+                    ..Default::default()
+                },
+            ],
+            internal_ext: "cursor-after-frame".to_string(),
+            need_ack: true,
+            ..Default::default()
+        };
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&response.encode_to_vec()).unwrap();
+        let frame = PushFrame {
+            log_id: 7,
+            payload: encoder.finish().unwrap(),
+            ..Default::default()
+        };
+
+        let (ack, events) = decode_binary_message(&frame.encode_to_vec(), "room").unwrap();
+
+        assert_eq!(ack.unwrap().payload, b"cursor-after-frame");
+        assert_eq!(events.len(), 1);
+        let DanmuMessageType::Event(event) = &events[0] else {
+            panic!("expected valid chat event")
+        };
+        assert_eq!(event.data["content"], "valid chat");
+    }
 }
 
 #[async_trait]
@@ -669,10 +807,7 @@ impl DanmuProvider for DouyinDanmu {
         })
     }
 
-    async fn start(
-        &self,
-        tx: mpsc::UnboundedSender<DanmuMessageType>,
-    ) -> Result<(), DanmuStreamError> {
+    async fn start(&self, tx: mpsc::Sender<DanmuMessageType>) -> Result<(), DanmuStreamError> {
         let mut retry_count = 0;
         const RETRY_DELAY: Duration = Duration::from_secs(5);
         info!(
@@ -699,6 +834,10 @@ impl DanmuProvider for DouyinDanmu {
                 }
             }
 
+            if *self.stop.read().await {
+                break;
+            }
+
             info!(
                 "Retrying connection in {} seconds... (Attempt {}), room_id: {}",
                 RETRY_DELAY.as_secs(),
@@ -714,8 +853,13 @@ impl DanmuProvider for DouyinDanmu {
     async fn stop(&self) -> Result<(), DanmuStreamError> {
         *self.stop.write().await = true;
         if let Some(mut write) = self.write.write().await.take() {
-            if let Err(e) = write.close().await {
-                error!("Failed to close WebSocket connection: {}", e);
+            match tokio::time::timeout(WEBSOCKET_WRITE_TIMEOUT, write.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => error!("Failed to close WebSocket connection: {error}"),
+                Err(_) => error!(
+                    "Timed out closing Douyin WebSocket after {} seconds",
+                    WEBSOCKET_WRITE_TIMEOUT.as_secs()
+                ),
             }
         }
         Ok(())

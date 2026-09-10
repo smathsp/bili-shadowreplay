@@ -59,10 +59,7 @@ impl DanmuProvider for BiliDanmu {
         })
     }
 
-    async fn start(
-        &self,
-        tx: mpsc::UnboundedSender<DanmuMessageType>,
-    ) -> Result<(), DanmuStreamError> {
+    async fn start(&self, tx: mpsc::Sender<DanmuMessageType>) -> Result<(), DanmuStreamError> {
         let mut retry_count = 0;
         const RETRY_DELAY: Duration = Duration::from_secs(5);
         info!(
@@ -122,7 +119,7 @@ impl DanmuProvider for BiliDanmu {
 impl BiliDanmu {
     async fn connect_and_handle(
         &self,
-        tx: mpsc::UnboundedSender<DanmuMessageType>,
+        tx: mpsc::Sender<DanmuMessageType>,
     ) -> Result<(), DanmuStreamError> {
         let wbi_key = self.get_wbi_key().await?;
         let real_room = self.get_real_room(&wbi_key, &self.room_id).await?;
@@ -198,7 +195,7 @@ impl BiliDanmu {
 
     async fn recv(
         mut read: WsReadType,
-        tx: mpsc::UnboundedSender<DanmuMessageType>,
+        tx: mpsc::Sender<DanmuMessageType>,
         stop: Arc<RwLock<bool>>,
         room_id: String,
     ) -> Result<(), DanmuStreamError> {
@@ -222,8 +219,8 @@ impl BiliDanmu {
                                         event.room_id = room_id.clone();
                                     }
                                     log::debug!("Received message: {:?}", v);
-                                    tx.send(v).map_err(|e| DanmuStreamError::WebsocketError {
-                                        err: e.to_string(),
+                                    tx.send(v).await.map_err(|e| {
+                                        DanmuStreamError::WebsocketError { err: e.to_string() }
                                     })?;
                                 }
                                 Err(e) => {

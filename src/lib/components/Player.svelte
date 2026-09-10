@@ -1429,21 +1429,47 @@ ${mediaPlaylistUrl}`;
 
   export async function exportDanmu(format: "txt" | "ass" | "jsonl") {
     console.log("Export danmus");
-    const content = (await invoke("export_danmu", {
-      options: {
-        platform: platform,
+    const options = {
+      platform: platform,
+      roomId: room_id,
+      liveId: live_id,
+      x: Math.floor(start),
+      y: Math.floor(end),
+      offset: global_offset,
+      localOffset: local_offset,
+      ass: format === "ass",
+      full: format === "jsonl",
+    };
+    const file_name = `danmu_${room_id}_${live_id}.${format}`;
+
+    // Let the browser stream complete JSONL straight to its download manager.
+    // Going through invoke would wrap the whole file in JSON and keep multiple
+    // copies of long-live danmu records in both server and browser memory.
+    if (!TAURI_ENV && format === "jsonl") {
+      const query = new URLSearchParams({
+        platform,
         roomId: room_id,
         liveId: live_id,
-        x: Math.floor(start),
-        y: Math.floor(end),
-        offset: global_offset,
-        localOffset: local_offset,
-        ass: format === "ass",
-        full: format === "jsonl",
-      },
-    })) as string;
+      });
+      const downloadUrl = `${ENDPOINT}/api/export_danmu_file?${query.toString()}`;
+      const preflight = await fetch(downloadUrl, { method: "HEAD" });
+      if (!preflight.ok) {
+        const message = preflight.statusText || `HTTP ${preflight.status}`;
+        throw new Error(`完整弹幕下载不可用：${message}`);
+      }
+      const a = document.createElement("a");
+      a.href = downloadUrl;
+      a.download = file_name;
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      return;
+    }
 
-    const file_name = `danmu_${room_id}_${live_id}.${format}`;
+    const content = (await invoke("export_danmu", { options })) as string;
     if (TAURI_ENV) {
       const path = await save({
         title: format === "jsonl" ? "导出完整弹幕" : "导出弹幕",

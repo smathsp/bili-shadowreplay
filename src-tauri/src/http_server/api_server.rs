@@ -1,6 +1,8 @@
 use std::{
     fmt::{self, Display},
+    io,
     path::PathBuf,
+    str::FromStr,
 };
 
 use crate::{
@@ -29,11 +31,12 @@ use crate::{
         },
         message::{delete_message, get_messages, read_message},
         recorder::{
-            add_recorder, delete_archive, delete_archives, export_danmu, fetch_hls,
-            generate_archive_subtitle, generate_whole_clip, get_archive, get_archive_disk_usage,
-            get_archive_subtitle, get_archives, get_archives_by_parent_id, get_danmu_record,
-            get_recent_record, get_recorder_list, get_room_info, get_today_record_count,
-            get_total_length, remove_recorder, send_danmaku, set_enable, ExportDanmuOptions,
+            add_recorder, delete_archive, delete_archives, export_danmu,
+            export_persisted_danmu_line, fetch_hls, generate_archive_subtitle, generate_whole_clip,
+            get_archive, get_archive_disk_usage, get_archive_subtitle, get_archives,
+            get_archives_by_parent_id, get_danmu_record, get_recent_record, get_recorder_list,
+            get_room_info, get_today_record_count, get_total_length, remove_recorder, send_danmaku,
+            set_enable, ExportDanmuOptions,
         },
         summary::{
             delete_archive_summary, generate_archive_summary, get_archive_summary,
@@ -64,7 +67,10 @@ use axum::extract::Query;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Json, Multipart, Path, Request},
-    http::StatusCode,
+    http::{
+        header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE},
+        HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
@@ -76,9 +82,11 @@ use recorder::{
         profile::Profile,
         response::Typelist,
     },
+    platforms::PlatformType,
     RecorderInfo,
 };
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
@@ -1808,6 +1816,223 @@ async fn handler_export_danmu(
     Ok(Json(ApiResponse::success(result)))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportDanmuFileQuery {
+    platform: String,
+    room_id: String,
+    live_id: String,
+}
+
+#[derive(Debug)]
+struct DanmuDownloadError {
+    status: StatusCode,
+    message: String,
+}
+
+impl DanmuDownloadError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for DanmuDownloadError {
+    fn into_response(self) -> Response {
+        (self.status, Json(ApiResponse::<()>::error(self.message))).into_response()
+    }
+}
+
+fn validate_archive_path_component(field: &str, value: &str) -> Result<(), DanmuDownloadError> {
+    let mut components = std::path::Path::new(value).components();
+    let is_single_normal_component = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if value.is_empty() || value.chars().count() > 255 || !is_single_normal_component {
+        return Err(DanmuDownloadError::bad_request(format!("Invalid {field}")));
+    }
+    Ok(())
+}
+
+async fn find_full_danmu_file(
+    state: &State,
+    params: &ExportDanmuFileQuery,
+) -> Result<Option<PathBuf>, DanmuDownloadError> {
+    validate_archive_path_component("roomId", &params.room_id)?;
+    validate_archive_path_component("liveId", &params.live_id)?;
+    let platform = PlatformType::from_str(&params.platform)
+        .map_err(|error| DanmuDownloadError::bad_request(error.to_string()))?;
+    let cache_path = state.config.read().await.cache.clone();
+    let cache_path = PathBuf::from(cache_path);
+    let canonical_cache_path = match tokio::fs::canonicalize(&cache_path).await {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(DanmuDownloadError::internal(format!(
+                "Failed to inspect cache directory {}: {error}",
+                cache_path.display()
+            )))
+        }
+    };
+    let archive_dir = cache_path
+        .join(platform.as_str())
+        .join(&params.room_id)
+        .join(&params.live_id);
+
+    for file_name in ["events.jsonl", "danmu.txt"] {
+        let path = archive_dir.join(file_name);
+        match tokio::fs::metadata(&path).await {
+            Ok(metadata) if metadata.is_file() => {
+                let canonical_path = tokio::fs::canonicalize(&path).await.map_err(|error| {
+                    DanmuDownloadError::internal(format!(
+                        "Failed to resolve danmu record {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                if !canonical_path.starts_with(&canonical_cache_path) {
+                    return Err(DanmuDownloadError::bad_request(
+                        "Danmu record is outside the cache directory",
+                    ));
+                }
+                return Ok(Some(canonical_path));
+            }
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(DanmuDownloadError::internal(format!(
+                    "Failed to inspect danmu record {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn download_filename(params: &ExportDanmuFileQuery) -> String {
+    fn ascii_component(value: &str) -> String {
+        value
+            .chars()
+            .take(96)
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+
+    format!(
+        "danmu_{}_{}.jsonl",
+        ascii_component(&params.room_id),
+        ascii_component(&params.live_id)
+    )
+}
+
+async fn full_danmu_download_response(
+    path: PathBuf,
+    params: &ExportDanmuFileQuery,
+) -> Result<Response, DanmuDownloadError> {
+    let file = tokio::fs::File::open(&path).await.map_err(|error| {
+        DanmuDownloadError::internal(format!(
+            "Failed to open danmu record {}: {error}",
+            path.display()
+        ))
+    })?;
+    let stream_state = (
+        BufReader::new(file),
+        params.platform.clone(),
+        params.room_id.clone(),
+    );
+    let stream = futures::stream::try_unfold(
+        stream_state,
+        |(mut reader, platform, room_id)| async move {
+            loop {
+                let mut bytes = Vec::new();
+                if reader.read_until(b'\n', &mut bytes).await? == 0 {
+                    return Ok(None);
+                }
+                let terminated = bytes.last() == Some(&b'\n');
+                if terminated {
+                    bytes.pop();
+                    if bytes.last() == Some(&b'\r') {
+                        bytes.pop();
+                    }
+                }
+                let line = match String::from_utf8(bytes) {
+                    Ok(line) => line,
+                    // A recording can be downloaded while it is still being
+                    // appended. Ignore only an unterminated UTF-8 tail; a bad
+                    // completed line remains an explicit stream error.
+                    Err(_) if !terminated => return Ok(None),
+                    Err(error) => {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, error));
+                    }
+                };
+                match export_persisted_danmu_line(&line, &platform, &room_id) {
+                    Ok(Some(mut exported)) => {
+                        exported.push('\n');
+                        return Ok(Some((exported, (reader, platform, room_id))));
+                    }
+                    Ok(None) => continue,
+                    // If the writer has not completed the final line yet,
+                    // finish this snapshot cleanly. Completed corrupt records
+                    // are logged and skipped so one crash residue cannot hide
+                    // every valid event appended after a restart.
+                    Err(_) if !terminated => return Ok(None),
+                    Err(error) => {
+                        log::warn!(
+                            "Skipping corrupt persisted danmu line for {platform}/{room_id}: {error}"
+                        );
+                        continue;
+                    }
+                }
+            }
+        },
+    );
+    let body = Body::from_stream(stream);
+
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let disposition = format!("attachment; filename=\"{}\"", download_filename(params));
+    response.headers_mut().insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition).map_err(|error| {
+            DanmuDownloadError::internal(format!("Invalid download filename: {error}"))
+        })?,
+    );
+    Ok(response)
+}
+
+async fn handler_export_danmu_file(
+    state: axum::extract::State<State>,
+    Query(params): Query<ExportDanmuFileQuery>,
+) -> Result<Response, DanmuDownloadError> {
+    let Some(path) = find_full_danmu_file(&state.0, &params).await? else {
+        return Ok((StatusCode::NOT_FOUND, "Danmu record not found").into_response());
+    };
+    full_danmu_download_response(path, &params).await
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DeleteTaskRequest {
@@ -2353,6 +2578,7 @@ pub async fn start_api_server(state: State) {
         .route("/api/delete_task", post(handler_delete_task))
         .route("/api/get_tasks", post(handler_get_tasks))
         .route("/api/export_danmu", post(handler_export_danmu))
+        .route("/api/export_danmu_file", get(handler_export_danmu_file))
         // Utils commands
         .route("/api/get_disk_info", post(handler_get_disk_info))
         .route("/api/get_logs", post(handler_get_logs))
@@ -2428,6 +2654,105 @@ mod tests {
         .unwrap();
         assert!(request.enabled);
         assert!(request.encode_danmu);
+    }
+
+    #[test]
+    fn danmu_file_query_uses_frontend_field_names_and_safe_paths() {
+        let query: ExportDanmuFileQuery = serde_json::from_value(serde_json::json!({
+            "platform": "douyin",
+            "roomId": "123456",
+            "liveId": "1788868414771"
+        }))
+        .unwrap();
+
+        assert_eq!(query.room_id, "123456");
+        assert_eq!(query.live_id, "1788868414771");
+        assert!(validate_archive_path_component("roomId", &query.room_id).is_ok());
+        assert!(validate_archive_path_component("roomId", "../other").is_err());
+        assert!(validate_archive_path_component("liveId", "folder/live").is_err());
+        assert!(validate_archive_path_component("liveId", "").is_err());
+        assert_eq!(
+            validate_archive_path_component("liveId", "../other")
+                .unwrap_err()
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            download_filename(&query),
+            "danmu_123456_1788868414771.jsonl"
+        );
+    }
+
+    #[tokio::test]
+    async fn danmu_file_response_streams_flattened_douyin_jsonl() {
+        let directory = TestDirectory::new();
+        let events_path = directory.0.join("events.jsonl");
+        let chat = danmu_stream::LiveEvent {
+            ts: 1_788_868_414_771,
+            platform: "douyin".to_string(),
+            room_id: "123456".to_string(),
+            event_type: "danmu".to_string(),
+            data: serde_json::json!({ "content": "终于能播了" }),
+            raw: serde_json::json!({
+                "id": "7683131321120630299",
+                "method": "WebcastChatMessage",
+                "user": {
+                    "id": "MS4w.test",
+                    "name": "枯枝邀明月",
+                    "fansClub": [{ "anchorId": "105460512869", "level": 9 }]
+                },
+                "content": "终于能播了",
+                "time": 1_788_868_414_771_i64,
+                "payloadHex": "0102"
+            }),
+        };
+        let gift = danmu_stream::LiveEvent {
+            ts: chat.ts,
+            platform: chat.platform.clone(),
+            room_id: chat.room_id.clone(),
+            event_type: "gift".to_string(),
+            data: serde_json::json!({ "giftName": "花束" }),
+            raw: serde_json::json!({ "method": "WebcastGiftMessage" }),
+        };
+        std::fs::write(
+            &events_path,
+            format!(
+                "corrupt completed line\n{}\n{}\n{{\"ts\":",
+                serde_json::to_string(&chat).unwrap(),
+                serde_json::to_string(&gift).unwrap()
+            ),
+        )
+        .unwrap();
+        let params = ExportDanmuFileQuery {
+            platform: "douyin".to_string(),
+            room_id: "123456".to_string(),
+            live_id: "1788868414771".to_string(),
+        };
+
+        let response = full_danmu_download_response(events_path, &params)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "application/x-ndjson; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers()[CONTENT_DISPOSITION],
+            "attachment; filename=\"danmu_123456_1788868414771.jsonl\""
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let lines = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 1);
+        let exported: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(exported, chat.raw);
+        assert!(exported.get("raw").is_none());
     }
 
     #[tokio::test]

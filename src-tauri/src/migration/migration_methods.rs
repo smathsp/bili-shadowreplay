@@ -7,7 +7,19 @@ use base64::Engine;
 use crate::database::Database;
 use crate::recorder_manager::RecorderManagerError;
 use recorder::entry::EntryStore;
+use recorder::platforms::douyin::{recovery_session_parent_fallback, DOUYIN_SESSION_PARENT_FILE};
 use recorder::platforms::PlatformType;
+
+async fn archived_file_size(path: &std::path::Path) -> Result<u64, std::io::Error> {
+    let mut size = 0_u64;
+    let mut entries = tokio::fs::read_dir(path).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_file() {
+            size = size.saturating_add(entry.metadata().await?.len());
+        }
+    }
+    Ok(size)
+}
 
 pub async fn try_rebuild_archives(
     db: &Arc<Database>,
@@ -17,73 +29,100 @@ pub async fn try_rebuild_archives(
     for room in rooms {
         let room_id = room.room_id;
         let room_cache_path = cache_path.join(format!("{}/{}", room.platform, room_id));
-        let mut files = tokio::fs::read_dir(room_cache_path).await?;
+        let platform = PlatformType::from_str(room.platform.as_str()).map_err(|_| {
+            RecorderManagerError::InvalidPlatformType {
+                platform: room.platform.to_string(),
+            }
+        })?;
+        let active_session_parent = if platform == PlatformType::Douyin {
+            recovery_session_parent_fallback(&cache_path, &room_id).await
+        } else {
+            None
+        };
+        let mut files = match tokio::fs::read_dir(&room_cache_path).await {
+            Ok(files) => files,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
         while let Some(file) = files.next_entry().await? {
             if file.file_type().await?.is_dir() {
                 // use folder name as live_id
                 let live_id = file.file_name();
-                let live_id = live_id.to_str().unwrap();
-                let record_path = file.path();
-                let entry_store = EntryStore::new(record_path.to_string_lossy().as_ref()).await;
-                let existing_record = db.get_record(&room_id, live_id).await;
-
-                // Empty folders are left behind when recording fails before the first segment.
-                // They are not archives and must not be restored as 0-byte records.
-                if entry_store.is_empty() {
-                    match existing_record {
-                        Ok(record) if record.size == 0 => {
-                            db.remove_record(live_id).await?;
-                            tokio::fs::remove_dir_all(&record_path).await?;
-                            log::info!("removed empty archive folder: {}", record_path.display());
-                        }
-                        Ok(_) => {
-                            log::warn!(
-                                "archive {} has database data but no cached entries; preserving it",
-                                record_path.display()
-                            );
-                        }
-                        Err(_) => {
-                            tokio::fs::remove_dir_all(&record_path).await?;
-                            log::info!("removed empty archive folder: {}", record_path.display());
-                        }
-                    }
+                let Some(live_id) = live_id.to_str().map(str::to_string) else {
+                    log::warn!(
+                        "ignoring archive folder with a non-Unicode name: {:?}",
+                        file.path()
+                    );
+                    continue;
+                };
+                if live_id.starts_with('.') {
+                    // Room-level recovery metadata such as
+                    // `.pending-live-ends` is not an archive attempt.
                     continue;
                 }
+                let record_path = file.path();
+                let entry_store = EntryStore::new(record_path.to_string_lossy().as_ref()).await;
+                let existing_record = db.get_record(&room_id, &live_id).await;
+
+                // EntryStore treats missing, unreadable and corrupt entries.log
+                // alike. Never delete user recordings based on `is_empty`.
+                // A pre-existing non-empty playlist is still enough to retain
+                // and rebuild the archive for whole-session generation.
+                let (archive_duration, archive_size) = if entry_store.is_empty() {
+                    let playlist_path = record_path.join("playlist.m3u8");
+                    let playlist_size = tokio::fs::metadata(&playlist_path)
+                        .await
+                        .ok()
+                        .filter(|metadata| metadata.is_file() && metadata.len() > 0)
+                        .map(|metadata| metadata.len());
+                    let Some(playlist_size) = playlist_size else {
+                        log::warn!(
+                            "preserving archive directory without readable entries or playlist: {}",
+                            record_path.display()
+                        );
+                        continue;
+                    };
+                    (
+                        0.0,
+                        archived_file_size(&record_path).await?.max(playlist_size),
+                    )
+                } else {
+                    (entry_store.total_duration(), entry_store.total_size())
+                };
 
                 // check if live_id is in db
                 if let Ok(record) = existing_record {
                     if record.size == 0 {
-                        db.update_record_delta(
-                            live_id,
-                            entry_store.total_duration(),
-                            entry_store.total_size(),
-                        )
-                        .await?;
+                        db.update_record_delta(&live_id, archive_duration, archive_size)
+                            .await?;
                     }
                     continue;
                 }
 
                 // create a record for this live_id
+                let persisted_parent = if platform == PlatformType::Douyin {
+                    tokio::fs::read_to_string(record_path.join(DOUYIN_SESSION_PARENT_FILE))
+                        .await
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .or_else(|| active_session_parent.clone())
+                } else {
+                    None
+                };
+                let parent_id = persisted_parent.as_deref().unwrap_or(&live_id);
                 let record = db
                     .add_record(
-                        PlatformType::from_str(room.platform.as_str()).map_err(|_| {
-                            RecorderManagerError::InvalidPlatformType {
-                                platform: room.platform.to_string(),
-                            }
-                        })?,
-                        live_id,
-                        live_id,
+                        platform,
+                        parent_id,
+                        &live_id,
                         &room_id,
                         &format!("UnknownLive {live_id}"),
                         None,
                     )
                     .await?;
-                db.update_record_delta(
-                    live_id,
-                    entry_store.total_duration(),
-                    entry_store.total_size(),
-                )
-                .await?;
+                db.update_record_delta(&live_id, archive_duration, archive_size)
+                    .await?;
 
                 log::info!("rebuild archive {record:?}");
             }

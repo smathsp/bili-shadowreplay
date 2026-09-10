@@ -35,6 +35,24 @@ const settingSource = await readFile(
   new URL("../../src/page/Setting.svelte", import.meta.url),
   "utf8",
 );
+const playerSource = await readFile(
+  new URL("../../src/lib/components/Player.svelte", import.meta.url),
+  "utf8",
+);
+const douyinProviderSource = await readFile(
+  new URL(
+    "../../src-tauri/crates/danmu_stream/src/provider/douyin.rs",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const douyinRecorderSource = await readFile(
+  new URL(
+    "../../src-tauri/crates/recorder/src/platforms/douyin.rs",
+    import.meta.url,
+  ),
+  "utf8",
+);
 
 async function collectFrontendSources(directory) {
   const sources = [];
@@ -149,4 +167,63 @@ test("headless-only API dependencies and live notifications are wired", () => {
   assert.doesNotMatch(videoEditingSource, /\.join\("output\.mp4"\)/);
   assert.match(recorderHandlerSource, /offset:\s*f64/);
   assert.match(recorderHandlerSource, /local_offset:\s*f64/);
+});
+
+test("Docker streams complete Douyin danmu without JSON response buffering", () => {
+  assert.match(
+    apiSource,
+    /route\("\/api\/export_danmu_file",\s*get\(handler_export_danmu_file\)\)/,
+  );
+  assert.match(apiSource, /Body::from_stream\(stream\)/);
+  assert.match(playerSource, /format === "jsonl"/);
+  assert.match(playerSource, /\/api\/export_danmu_file\?/);
+  assert.match(playerSource, /method: "HEAD"/);
+  assert.match(playerSource, /if \(!preflight\.ok\)/);
+});
+
+test("Douyin websocket sends heartbeat and ACK data over the real connection", () => {
+  assert.doesNotMatch(douyinProviderSource, /mut _rx_write/);
+  assert.doesNotMatch(douyinProviderSource, /webcast5-ws-web-hl\.douyin\.com/);
+  assert.match(
+    douyinProviderSource,
+    /self\.send_ws_message\(Self::heartbeat_message\(\), "heartbeat"\)/,
+  );
+  assert.match(
+    douyinProviderSource,
+    /payload:\s*response\.internal_ext\.as_bytes\(\)\.to_vec\(\)/,
+  );
+  assert.match(douyinProviderSource, /let \(ack, events\) = decode_binary_message/);
+  assert.ok(
+    douyinProviderSource.indexOf("for event in events") <
+      douyinProviderSource.indexOf('"ack"'),
+    "Douyin frames must enter the lossless queue before they are ACKed",
+  );
+  assert.match(
+    douyinProviderSource,
+    /forward_event[\s\S]*?heartbeat\.tick\(\)[\s\S]*?send_ws_message/,
+  );
+  assert.match(douyinProviderSource, /wait_for_persistence/);
+  assert.match(douyinProviderSource, /DanmuMessageType::PersistBarrier/);
+});
+
+test("Douyin realtime danmu cannot displace lifecycle events", () => {
+  assert.match(douyinRecorderSource, /realtime_event_sink/);
+  assert.match(
+    recorderManagerSource,
+    /let realtime_event_sink = Arc::new\(move \|event: RecorderEvent\|/,
+  );
+});
+
+test("Douyin Docker recordings fail visibly and recover live sessions after restart", () => {
+  assert.match(douyinRecorderSource, /DOUYIN_ACTIVE_SESSION_FILE/);
+  assert.match(douyinRecorderSource, /load_active_session\(&cache_dir, room_id\)\.await/);
+  assert.match(douyinRecorderSource, /emit_live_end_and_reset/);
+  assert.match(douyinRecorderSource, /DOUYIN_DANMU_SHUTDOWN_TIMEOUT/);
+  assert.match(douyinRecorderSource, /session_transition/);
+  assert.match(recorderManagerSource, /acknowledge_live_end/);
+  assert.match(
+    douyinRecorderSource,
+    /let Some\(danmu_storage\) = DanmuStorage::new\(&danmu_path\)\.await else/,
+  );
+  assert.match(douyinRecorderSource, /抖音弹幕保存失败/);
 });

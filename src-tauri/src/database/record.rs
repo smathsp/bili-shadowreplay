@@ -87,12 +87,18 @@ impl Database {
             created_at: Utc::now().to_rfc3339().to_string(),
             cover,
         };
-        if let Err(e) = sqlx::query("INSERT INTO records (live_id, room_id, title, length, size, cover, created_at, platform, parent_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)").bind(record.live_id.clone())
+        if let Err(error) = sqlx::query("INSERT INTO records (live_id, room_id, title, length, size, cover, created_at, platform, parent_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)").bind(record.live_id.clone())
             .bind(&record.room_id).bind(&record.title).bind(0).bind(0).bind(&record.cover).bind(&record.created_at).bind(platform.as_str().to_string()).bind(parent_id).execute(&lock).await {
-                // if the record already exists, return the existing record
-                if e.to_string().contains("UNIQUE constraint failed") {
+                // If the record already exists, return the durable row. All
+                // other SQL failures must propagate so startup recovery cannot
+                // report a synthetic success for an insert that never happened.
+                if error
+                    .as_database_error()
+                    .is_some_and(|database_error| database_error.is_unique_violation())
+                {
                     return self.get_record(room_id, live_id).await;
                 }
+                return Err(error.into());
             }
         Ok(record)
     }

@@ -308,7 +308,7 @@ impl BiliRecorder {
                                         );
                                     }
                                     if let Some(storage) = self.danmu_storage.write().await.as_ref() {
-                                        if let Err(error) = storage.add_event(event).await {
+                                        if let Err(error) = storage.add_event(&event).await {
                                             log::error!("Failed to persist live event: {error}");
                                         }
                                     }
@@ -323,10 +323,13 @@ impl BiliRecorder {
                                         room: self.room_id.clone(), ts, content,
                                     });
                                     if let Some(storage) = self.danmu_storage.write().await.as_ref() {
-                                        if let Err(error) = storage.add_event(event).await {
+                                        if let Err(error) = storage.add_event(&event).await {
                                             log::error!("Failed to persist danmu event: {error}");
                                         }
                                     }
+                                }
+                                DanmuMessageType::PersistBarrier(reply) => {
+                                    let _ = reply.send(Ok(()));
                                 }
                             }
                         }
@@ -534,7 +537,10 @@ mod tests {
         *recorder.platform_live_id.write().await = "session-1".into();
         *recorder.live_id.write().await = "segment-1".into();
         *recorder.extra.pre_live_id.write().await = Some("segment-1".into());
-        recorder.extra.should_continue.store(true, Ordering::Relaxed);
+        recorder
+            .extra
+            .should_continue
+            .store(true, Ordering::Relaxed);
         recorder.is_recording.store(true, Ordering::Relaxed);
         *recorder.extra.live_stream.write().await = Some(BiliStream::new(
             Format::TS,
@@ -550,7 +556,9 @@ mod tests {
     #[tokio::test]
     async fn recording_reset_preserves_session_and_expiry_resume_state() {
         let (recorder, _) = recording_fixture().await;
-        tokio::fs::create_dir_all(&recorder.cache_dir).await.unwrap();
+        tokio::fs::create_dir_all(&recorder.cache_dir)
+            .await
+            .unwrap();
         *recorder.danmu_storage.write().await =
             DanmuStorage::new(&recorder.cache_dir.join("events.jsonl")).await;
         assert!(recorder.danmu_storage.read().await.is_some());
@@ -568,7 +576,9 @@ mod tests {
             Some("segment-1")
         );
         assert!(recorder.extra.should_continue.load(Ordering::Relaxed));
-        tokio::fs::remove_dir_all(&recorder.cache_dir).await.unwrap();
+        tokio::fs::remove_dir_all(&recorder.cache_dir)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -585,7 +595,10 @@ mod tests {
 
         recorder.end_live().await;
 
-        let RecorderEvent::LiveEnd { recorder: ended, .. } = rx.try_recv().unwrap() else {
+        let RecorderEvent::LiveEnd {
+            recorder: ended, ..
+        } = rx.try_recv().unwrap()
+        else {
             panic!("expected a live end event")
         };
         assert_eq!(ended.platform_live_id, "session-1");

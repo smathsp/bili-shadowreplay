@@ -26,6 +26,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     DanmuMessageType::DanmuMessage(danmu) => {
                         log::info!("Received danmu message: {:?}", danmu.message);
                     }
+                    DanmuMessageType::PersistBarrier(reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
                 }
             } else {
                 log::info!("Channel closed");
