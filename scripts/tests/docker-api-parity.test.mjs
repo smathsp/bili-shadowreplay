@@ -175,6 +175,10 @@ test("Docker streams complete Douyin danmu without JSON response buffering", () 
     /route\("\/api\/export_danmu_file",\s*get\(handler_export_danmu_file\)\)/,
   );
   assert.match(apiSource, /Body::from_stream\(stream\)/);
+  assert.match(
+    recorderHandlerSource,
+    /Docker 完整弹幕请使用流式 GET \/api\/export_danmu_file/,
+  );
   assert.match(playerSource, /format === "jsonl"/);
   assert.match(playerSource, /\/api\/export_danmu_file\?/);
   assert.match(playerSource, /method: "HEAD"/);
@@ -222,11 +226,25 @@ test("Douyin realtime danmu cannot displace lifecycle events", () => {
 
 test("Douyin Docker recordings fail visibly and recover live sessions after restart", () => {
   assert.match(douyinRecorderSource, /DOUYIN_ACTIVE_SESSION_FILE/);
-  assert.match(douyinRecorderSource, /load_active_session\(&cache_dir, room_id\)\.await/);
+  assert.match(
+    douyinRecorderSource,
+    /try_load_active_session\(&cache_dir, room_id\)\.await\?/,
+  );
+  assert.match(douyinRecorderSource, /struct ActiveSessionMarker/);
+  assert.match(douyinRecorderSource, /new_incarnation_token/);
+  assert.match(douyinRecorderSource, /platform_session_id/);
+  assert.match(douyinRecorderSource, /live_start_pending/);
   assert.match(douyinRecorderSource, /emit_live_end_and_reset/);
   assert.match(douyinRecorderSource, /DOUYIN_DANMU_SHUTDOWN_TIMEOUT/);
   assert.match(douyinRecorderSource, /session_transition/);
   assert.match(recorderManagerSource, /acknowledge_live_end/);
+  assert.match(recorderManagerSource, /DOUYIN_WHOLE_COMPLETIONS_DIR/);
+  assert.match(recorderManagerSource, /douyin_whole_output_name/);
+  assert.match(recorderManagerSource, /\.partial\.mp4/);
+  assert.match(
+    recorderManagerSource,
+    /douyin_playlist_has_local_media_segment/,
+  );
   assert.match(
     douyinRecorderSource,
     /let Some\(danmu_storage\) = DanmuStorage::new\(&danmu_path\)\.await else/,

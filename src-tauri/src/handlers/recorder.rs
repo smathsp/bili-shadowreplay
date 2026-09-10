@@ -471,11 +471,25 @@ pub async fn export_danmu(
 ) -> Result<String, String> {
     let platform = PlatformType::from_str(&options.platform)?;
     if options.full {
-        let events = state
-            .recorder_manager
-            .load_danmu_events(platform, &options.room_id, &options.live_id)
-            .await?;
-        return export_full_danmu_jsonl(&events);
+        #[cfg(feature = "headless")]
+        {
+            // The HTTP command response has to buffer its complete String.
+            // Long Douyin sessions can contain millions of metadata-rich
+            // records, so Docker clients must use the line-by-line download
+            // endpoint instead of risking a container-wide OOM here.
+            return Err(
+                "Docker 完整弹幕请使用流式 GET /api/export_danmu_file，POST /api/export_danmu 不支持 full=true"
+                    .to_string(),
+            );
+        }
+        #[cfg(not(feature = "headless"))]
+        {
+            let events = state
+                .recorder_manager
+                .load_danmu_events(platform, &options.room_id, &options.live_id)
+                .await?;
+            return export_full_danmu_jsonl(&events);
+        }
     }
 
     let mut danmus = state

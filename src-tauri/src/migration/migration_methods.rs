@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -31,6 +31,47 @@ async fn has_nonempty_douyin_danmu(path: &std::path::Path) -> bool {
         }
     }
     false
+}
+
+async fn playlist_has_local_media_segment(
+    archive_path: &Path,
+    playlist_path: &Path,
+) -> Result<bool, std::io::Error> {
+    let bytes = tokio::fs::read(playlist_path).await?;
+    let Ok((_, playlist)) = m3u8_rs::parse_media_playlist(&bytes) else {
+        log::warn!(
+            "preserving archive with an unreadable playlist as data-only: {}",
+            playlist_path.display()
+        );
+        return Ok(false);
+    };
+
+    for segment in playlist.segments {
+        // HLS downloads keep the URI path but remove query/fragment suffixes.
+        // Reject absolute or parent-relative paths so migration cannot mistake
+        // an unrelated file outside the archive for recorded media.
+        let uri_path = segment.uri.split(['?', '#']).next().unwrap_or_default();
+        let relative_path = Path::new(uri_path);
+        if uri_path.is_empty()
+            || relative_path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::Prefix(_) | Component::RootDir | Component::ParentDir
+                )
+            })
+        {
+            continue;
+        }
+
+        if tokio::fs::metadata(archive_path.join(relative_path))
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 pub async fn try_rebuild_archives(
@@ -78,8 +119,10 @@ pub async fn try_rebuild_archives(
 
                 // EntryStore treats missing, unreadable and corrupt entries.log
                 // alike. Never delete user recordings based on `is_empty`.
-                // A pre-existing non-empty playlist is still enough to retain
-                // and rebuild the archive for whole-session generation.
+                // A playlist is video evidence only when at least one listed
+                // media segment exists on disk. A header-only playlist is a
+                // normal crash/early-stop artifact and must not trigger an
+                // endless whole-session FFmpeg retry.
                 let (archive_duration, archive_size) = if entry_store.is_empty() {
                     let playlist_path = record_path.join("playlist.m3u8");
                     let playlist_size = tokio::fs::metadata(&playlist_path)
@@ -87,13 +130,22 @@ pub async fn try_rebuild_archives(
                         .ok()
                         .filter(|metadata| metadata.is_file() && metadata.len() > 0)
                         .map(|metadata| metadata.len());
-                    if let Some(playlist_size) = playlist_size {
+                    let has_playlist = playlist_size.is_some();
+                    let usable_playlist_size = match playlist_size {
+                        Some(size) if platform == PlatformType::Douyin => {
+                            playlist_has_local_media_segment(&record_path, &playlist_path)
+                                .await?
+                                .then_some(size)
+                        }
+                        size => size,
+                    };
+                    if let Some(playlist_size) = usable_playlist_size {
                         (
                             0.0,
                             archived_file_size(&record_path).await?.max(playlist_size),
                         )
                     } else if platform == PlatformType::Douyin
-                        && has_nonempty_douyin_danmu(&record_path).await
+                        && (has_playlist || has_nonempty_douyin_danmu(&record_path).await)
                     {
                         // A crash can happen after events.jsonl is created but
                         // before RecordStart reaches the database or any video
@@ -101,7 +153,7 @@ pub async fn try_rebuild_archives(
                         // for full-danmu export, but size=0 must continue to mean
                         // that no playable archive exists for auto generation.
                         log::info!(
-                            "rebuilding danmu-only Douyin archive: {}",
+                            "rebuilding data-only Douyin archive: {}",
                             record_path.display()
                         );
                         (0.0, 0)
@@ -132,10 +184,11 @@ pub async fn try_rebuild_archives(
 
                 // check if live_id is in db
                 if let Ok(record) = existing_record {
-                    if let Some(parent_id) = persisted_session_parent.as_deref() {
-                        if record.parent_id != parent_id {
-                            db.update_record_parent_id(&live_id, parent_id).await?;
-                        }
+                    let repaired_parent_id = persisted_session_parent
+                        .as_deref()
+                        .filter(|parent_id| record.parent_id.as_str() != *parent_id);
+                    if let Some(parent_id) = repaired_parent_id {
+                        db.update_record_parent_id(&live_id, parent_id).await?;
                     }
                     if record.size == 0 {
                         db.update_record_delta(&live_id, archive_duration, archive_size)
@@ -428,6 +481,68 @@ mod tests {
             .iter()
             .all(|archive| archive.size == 0 && archive.length == 0.0));
         assert!(db.get_record("room", "empty-attempt").await.is_err());
+        let _ = tokio::fs::remove_dir_all(cache_dir).await;
+    }
+
+    #[tokio::test]
+    async fn rebuild_requires_a_real_douyin_playlist_segment_for_video_size() {
+        let db = migration_database().await;
+        db.add_recorder(PlatformType::Douyin, "room", "")
+            .await
+            .unwrap();
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "bili-shadowreplay-playlist-rebuild-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let room_dir = cache_dir.join(PlatformType::Douyin.as_str()).join("room");
+        for live_id in ["header-only", "missing-segment", "real-segment"] {
+            let attempt_dir = room_dir.join(live_id);
+            tokio::fs::create_dir_all(&attempt_dir).await.unwrap();
+            tokio::fs::write(
+                attempt_dir.join(DOUYIN_SESSION_PARENT_FILE),
+                "session-parent",
+            )
+            .await
+            .unwrap();
+        }
+
+        tokio::fs::write(room_dir.join("header-only/playlist.m3u8"), "#EXTM3U\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            room_dir.join("missing-segment/playlist.m3u8"),
+            "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:1.0,\nmissing.ts\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            room_dir.join("real-segment/playlist.m3u8"),
+            "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:1.0,\nsegment.ts?token=test\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(room_dir.join("real-segment/segment.ts"), b"media")
+            .await
+            .unwrap();
+
+        try_rebuild_archives(&db, cache_dir.clone()).await.unwrap();
+
+        let archives = db
+            .get_archives_by_parent_id("room", "session-parent")
+            .await
+            .unwrap();
+        assert_eq!(archives.len(), 3);
+        for archive in archives {
+            match archive.live_id.as_str() {
+                "header-only" | "missing-segment" => assert_eq!(archive.size, 0),
+                "real-segment" => assert!(archive.size > 0),
+                unexpected => panic!("unexpected archive {unexpected}"),
+            }
+        }
+
+        assert!(room_dir.join("header-only/playlist.m3u8").exists());
+        assert!(room_dir.join("missing-segment/playlist.m3u8").exists());
         let _ = tokio::fs::remove_dir_all(cache_dir).await;
     }
 }

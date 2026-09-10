@@ -31,6 +31,10 @@ pub type DouyinRecorder = Recorder<DouyinExtra>;
 #[derive(Clone)]
 pub struct DouyinExtra {
     sec_user_id: String,
+    /// The provider's webcast room id used for API transitions and danmu.
+    /// `Recorder::platform_live_id` stores the stable incarnation token used
+    /// as archive parent/LiveEnd key instead.
+    platform_session_id: Arc<RwLock<String>>,
     stream_url: Arc<RwLock<Option<String>>>,
     danmu_stream: Arc<Mutex<Option<DanmuStream>>>,
     danmu_shutdown: Arc<Mutex<()>>,
@@ -42,6 +46,7 @@ pub struct DouyinExtra {
     recent_event_ids: Arc<Mutex<EventDeduplicator>>,
     pending_event_ids: Arc<Mutex<Vec<PendingEventId>>>,
     danmu_storage_generation: Arc<atomic::AtomicU64>,
+    live_start_pending: Arc<atomic::AtomicBool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,8 +57,77 @@ struct PendingEventId {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingLiveEnd {
-    session_id: String,
+    platform_session_id: String,
+    incarnation_token: String,
     marker_persisted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveSessionMarker {
+    version: u8,
+    platform_session_id: String,
+    incarnation_token: String,
+}
+
+impl ActiveSessionMarker {
+    fn legacy(session_id: String) -> Self {
+        Self {
+            version: 0,
+            platform_session_id: session_id.clone(),
+            incarnation_token: session_id,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.platform_session_id.trim().is_empty() && !self.incarnation_token.trim().is_empty()
+    }
+}
+
+impl From<&str> for ActiveSessionMarker {
+    fn from(session_id: &str) -> Self {
+        Self::legacy(session_id.to_string())
+    }
+}
+
+impl From<&ActiveSessionMarker> for ActiveSessionMarker {
+    fn from(marker: &ActiveSessionMarker) -> Self {
+        marker.clone()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingLiveEndMarker {
+    version: u8,
+    platform_session_id: String,
+    incarnation_token: String,
+}
+
+impl From<&ActiveSessionMarker> for PendingLiveEndMarker {
+    fn from(marker: &ActiveSessionMarker) -> Self {
+        Self {
+            version: 1,
+            platform_session_id: marker.platform_session_id.clone(),
+            incarnation_token: marker.incarnation_token.clone(),
+        }
+    }
+}
+
+impl From<&str> for PendingLiveEndMarker {
+    fn from(session_id: &str) -> Self {
+        Self {
+            version: 0,
+            platform_session_id: session_id.to_string(),
+            incarnation_token: session_id.to_string(),
+        }
+    }
+}
+
+impl From<&PendingLiveEndMarker> for PendingLiveEndMarker {
+    fn from(marker: &PendingLiveEndMarker) -> Self {
+        marker.clone()
+    }
 }
 
 const DOUYIN_DEDUP_CAPACITY: usize = 8192;
@@ -170,60 +244,155 @@ fn decode_session_marker_name(encoded: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-async fn load_pending_live_ends(cache_dir: &Path, room_id: &str) -> VecDeque<String> {
+fn new_incarnation_token() -> String {
+    format!("dy-{}", uuid::Uuid::new_v4().simple())
+}
+
+fn parse_active_session_marker(contents: &str) -> Option<ActiveSessionMarker> {
+    let contents = contents.trim();
+    if contents.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<ActiveSessionMarker>(contents) {
+        Ok(marker) if marker.is_valid() => Some(marker),
+        Ok(_) => None,
+        // Pre-incarnation releases stored the raw platform id as plain text.
+        Err(_) => Some(ActiveSessionMarker::legacy(contents.to_string())),
+    }
+}
+
+async fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        tokio::fs::File::open(path).await?.sync_all().await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+async fn try_load_pending_live_ends(
+    cache_dir: &Path,
+    room_id: &str,
+) -> std::io::Result<VecDeque<PendingLiveEnd>> {
     let _marker_guard = DOUYIN_SESSION_MARKER_LOCK.lock().await;
     let path = pending_live_ends_path(cache_dir, room_id);
     let mut entries = match tokio::fs::read_dir(&path).await {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return VecDeque::new(),
-        Err(error) => {
-            log::warn!("Failed to read pending Douyin LiveEnd markers {path:?}: {error}");
-            return VecDeque::new();
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(VecDeque::new()),
+        Err(error) => return Err(error),
     };
-    let mut sessions = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Some(session_id) = entry
+    let mut sessions = Vec::<PendingLiveEnd>::new();
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_file() {
+            continue;
+        }
+        let Some(file_token) = entry
             .file_name()
             .to_str()
             .and_then(decode_session_marker_name)
-        {
-            sessions.push(session_id);
-        }
+        else {
+            log::warn!(
+                "Ignoring invalid Douyin LiveEnd marker name: {:?}",
+                entry.path()
+            );
+            continue;
+        };
+        let contents = tokio::fs::read_to_string(entry.path()).await?;
+        let marker = if contents.trim().is_empty() {
+            // Legacy marker: the filename was both the provider id and parent.
+            PendingLiveEndMarker {
+                version: 0,
+                platform_session_id: file_token.clone(),
+                incarnation_token: file_token.clone(),
+            }
+        } else {
+            let marker =
+                serde_json::from_str::<PendingLiveEndMarker>(&contents).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid Douyin LiveEnd marker {:?}: {error}", entry.path()),
+                    )
+                })?;
+            if marker.platform_session_id.trim().is_empty()
+                || marker.incarnation_token.trim().is_empty()
+                || marker.incarnation_token != file_token
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("inconsistent Douyin LiveEnd marker: {:?}", entry.path()),
+                ));
+            }
+            marker
+        };
+        sessions.push(PendingLiveEnd {
+            platform_session_id: marker.platform_session_id,
+            incarnation_token: marker.incarnation_token,
+            marker_persisted: true,
+        });
     }
     if sessions
         .iter()
-        .all(|session| session.parse::<u128>().is_ok())
+        .all(|session| session.incarnation_token.parse::<u128>().is_ok())
     {
-        sessions.sort_by_key(|session| session.parse::<u128>().unwrap_or_default());
+        sessions.sort_by_key(|session| {
+            session
+                .incarnation_token
+                .parse::<u128>()
+                .unwrap_or_default()
+        });
     } else {
-        sessions.sort();
+        sessions.sort_by(|left, right| left.incarnation_token.cmp(&right.incarnation_token));
     }
-    sessions.dedup();
-    sessions.into()
+    sessions.dedup_by(|left, right| left.incarnation_token == right.incarnation_token);
+    Ok(sessions.into())
 }
 
-async fn load_active_session(cache_dir: &Path, room_id: &str) -> String {
+async fn load_pending_live_ends(cache_dir: &Path, room_id: &str) -> VecDeque<PendingLiveEnd> {
+    match try_load_pending_live_ends(cache_dir, room_id).await {
+        Ok(pending) => pending,
+        Err(error) => {
+            log::warn!("Failed to read pending Douyin LiveEnd markers: {error}");
+            VecDeque::new()
+        }
+    }
+}
+
+async fn try_load_active_session(
+    cache_dir: &Path,
+    room_id: &str,
+) -> std::io::Result<Option<ActiveSessionMarker>> {
     let _marker_guard = DOUYIN_SESSION_MARKER_LOCK.lock().await;
     let path = active_session_path(cache_dir, room_id);
     match tokio::fs::read_to_string(&path).await {
-        Ok(session_id) => {
-            let session_id = session_id.trim().to_string();
-            if session_id.is_empty() {
-                log::warn!("Ignoring empty Douyin active-session marker: {path:?}");
-            } else {
-                log::info!(
-                    "Recovered interrupted Douyin live session {} for room {}",
-                    session_id,
-                    room_id
-                );
-            }
-            session_id
+        Ok(contents) => {
+            let marker = parse_active_session_marker(&contents).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("empty or invalid Douyin active-session marker: {path:?}"),
+                )
+            })?;
+            log::info!(
+                "Recovered interrupted Douyin live session {} ({}) for room {}",
+                marker.platform_session_id,
+                marker.incarnation_token,
+                room_id
+            );
+            Ok(Some(marker))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn load_active_session(cache_dir: &Path, room_id: &str) -> Option<ActiveSessionMarker> {
+    match try_load_active_session(cache_dir, room_id).await {
+        Ok(marker) => marker,
         Err(error) => {
-            log::warn!("Failed to read Douyin active-session marker {path:?}: {error}");
-            String::new()
+            log::warn!("Failed to read Douyin active-session marker: {error}");
+            None
         }
     }
 }
@@ -231,7 +400,7 @@ async fn load_active_session(cache_dir: &Path, room_id: &str) -> String {
 async fn clear_active_session_if_matches(
     cache_dir: &Path,
     room_id: &str,
-    session_id: &str,
+    incarnation_token: &str,
 ) -> std::io::Result<bool> {
     let _marker_guard = DOUYIN_SESSION_MARKER_LOCK.lock().await;
     let path = active_session_path(cache_dir, room_id);
@@ -240,7 +409,13 @@ async fn clear_active_session_if_matches(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    if current.trim() != session_id {
+    let Some(current) = parse_active_session_marker(&current) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid Douyin active-session marker",
+        ));
+    };
+    if current.incarnation_token != incarnation_token {
         return Ok(false);
     }
     match tokio::fs::remove_file(path).await {
@@ -268,35 +443,67 @@ async fn pending_live_end_marker_exists(
 pub async fn recovery_session_parent_fallback(cache_dir: &Path, room_id: &str) -> Option<String> {
     let active = load_active_session(cache_dir, room_id).await;
     let pending = load_pending_live_ends(cache_dir, room_id).await;
-    let mut sessions = pending.into_iter().collect::<Vec<_>>();
-    if !active.is_empty() && !sessions.contains(&active) {
-        sessions.push(active);
+    let mut sessions = pending
+        .into_iter()
+        .map(|pending| pending.incarnation_token)
+        .collect::<Vec<_>>();
+    if let Some(active) = active {
+        if !sessions.contains(&active.incarnation_token) {
+            sessions.push(active.incarnation_token);
+        }
     }
     (sessions.len() == 1).then(|| sessions.remove(0))
 }
 
-async fn persist_pending_live_end(
+async fn persist_pending_live_end<M>(
     cache_dir: &Path,
     room_id: &str,
-    session_id: &str,
-) -> std::io::Result<()> {
-    if session_id.is_empty() {
+    marker: M,
+) -> std::io::Result<()>
+where
+    M: Into<PendingLiveEndMarker>,
+{
+    let marker = marker.into();
+    if marker.platform_session_id.trim().is_empty() || marker.incarnation_token.trim().is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "cannot persist an empty Douyin session id",
+            "cannot persist an empty Douyin session identity",
         ));
     }
     let _marker_guard = DOUYIN_SESSION_MARKER_LOCK.lock().await;
     let pending_dir = pending_live_ends_path(cache_dir, room_id);
     tokio::fs::create_dir_all(&pending_dir).await?;
-    let pending_path = pending_dir.join(encode_session_marker_name(session_id));
-    let file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&pending_path)
-        .await?;
-    file.sync_all().await?;
+    let pending_path = pending_dir.join(encode_session_marker_name(&marker.incarnation_token));
+    let temporary_path = pending_dir.join(format!(
+        ".{}.{}.tmp",
+        encode_session_marker_name(&marker.incarnation_token),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let bytes = serde_json::to_vec(&marker).map_err(std::io::Error::other)?;
+    let mut file = tokio::fs::File::create(&temporary_path).await?;
+    file.write_all(&bytes).await?;
+    file.flush().await?;
+    file.sync_data().await?;
+    drop(file);
+    if let Err(error) = tokio::fs::rename(&temporary_path, &pending_path).await {
+        #[cfg(not(unix))]
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+        ) {
+            let _ = tokio::fs::remove_file(&pending_path).await;
+            tokio::fs::rename(&temporary_path, &pending_path).await?;
+        } else {
+            let _ = tokio::fs::remove_file(&temporary_path).await;
+            return Err(error);
+        }
+        #[cfg(unix)]
+        {
+            let _ = tokio::fs::remove_file(&temporary_path).await;
+            return Err(error);
+        }
+    }
+    sync_parent_directory(&pending_dir).await?;
     Ok(())
 }
 
@@ -334,20 +541,30 @@ impl DouyinRecorder {
         update_interval: Arc<atomic::AtomicU64>,
         enabled: bool,
     ) -> Result<Self, crate::errors::RecorderError> {
-        let mut recovered_session_id = load_active_session(&cache_dir, room_id).await;
-        let pending_session_ids = load_pending_live_ends(&cache_dir, room_id).await;
+        // Recorder startup must stop on marker I/O/corruption. Treating an
+        // unreadable Docker bind mount as "no session" can orphan the previous
+        // LiveEnd and overwrite its only recovery state.
+        let mut recovered_session = try_load_active_session(&cache_dir, room_id).await?;
+        let pending_live_ends = try_load_pending_live_ends(&cache_dir, room_id).await?;
         // A crash can occur after the pending marker is created but before the
-        // old active marker is removed. Clear it before accepting a new live:
-        // Douyin can reuse the same platform ID, and a later ACK for the old
-        // pending marker must not erase that new incarnation's active marker.
-        if !recovered_session_id.is_empty() && pending_session_ids.contains(&recovered_session_id) {
-            match clear_active_session_if_matches(&cache_dir, room_id, &recovered_session_id).await
-            {
-                Ok(true) => recovered_session_id.clear(),
+        // same incarnation's active marker is removed. A newer live may reuse
+        // the provider id, but it receives a different incarnation token and
+        // therefore never matches this cleanup.
+        if recovered_session.as_ref().is_some_and(|active| {
+            pending_live_ends
+                .iter()
+                .any(|pending| pending.incarnation_token == active.incarnation_token)
+        }) {
+            let stale_token = recovered_session
+                .as_ref()
+                .map(|session| session.incarnation_token.clone())
+                .unwrap_or_default();
+            match clear_active_session_if_matches(&cache_dir, room_id, &stale_token).await {
+                Ok(true) => recovered_session = None,
                 Ok(false) => {
                     // The file changed between the initial read and cleanup.
                     // Preserve the newer value instead of clearing it blindly.
-                    recovered_session_id = load_active_session(&cache_dir, room_id).await;
+                    recovered_session = try_load_active_session(&cache_dir, room_id).await?;
                 }
                 Err(error) => {
                     let message = format!(
@@ -362,13 +579,13 @@ impl DouyinRecorder {
                 }
             }
         }
-        let pending_live_ends = pending_session_ids
-            .into_iter()
-            .map(|session_id| PendingLiveEnd {
-                session_id,
-                marker_persisted: true,
-            })
-            .collect();
+        let recovered_platform_session_id = recovered_session
+            .as_ref()
+            .map(|session| session.platform_session_id.clone())
+            .unwrap_or_default();
+        let recovered_incarnation_token = recovered_session
+            .map(|session| session.incarnation_token)
+            .unwrap_or_default();
         Ok(Self {
             platform: PlatformType::Douyin,
             room_id: room_id.to_string(),
@@ -381,7 +598,7 @@ impl DouyinRecorder {
             is_recording: Arc::new(atomic::AtomicBool::new(false)),
             room_info: Arc::new(RwLock::new(RoomInfo::default())),
             user_info: Arc::new(RwLock::new(UserInfo::default())),
-            platform_live_id: Arc::new(RwLock::new(recovered_session_id)),
+            platform_live_id: Arc::new(RwLock::new(recovered_incarnation_token)),
             live_id: Arc::new(RwLock::new(String::new())),
             danmu_storage: Arc::new(RwLock::new(None)),
             last_update: Arc::new(atomic::AtomicI64::new(Utc::now().timestamp())),
@@ -391,6 +608,7 @@ impl DouyinRecorder {
             update_interval,
             extra: DouyinExtra {
                 sec_user_id: sec_user_id.to_string(),
+                platform_session_id: Arc::new(RwLock::new(recovered_platform_session_id)),
                 stream_url: Arc::new(RwLock::new(None)),
                 danmu_stream: Arc::new(Mutex::new(None)),
                 danmu_shutdown: Arc::new(Mutex::new(())),
@@ -402,6 +620,7 @@ impl DouyinRecorder {
                 recent_event_ids: Arc::new(Mutex::new(EventDeduplicator::default())),
                 pending_event_ids: Arc::new(Mutex::new(Vec::new())),
                 danmu_storage_generation: Arc::new(atomic::AtomicU64::new(0)),
+                live_start_pending: Arc::new(atomic::AtomicBool::new(false)),
             },
         })
     }
@@ -462,7 +681,7 @@ impl DouyinRecorder {
                 // Docker can stop while a live is still running. The marker
                 // lets the next container either resume the same Douyin live,
                 // or finish the previous session if it ended while offline.
-                let recovered_session_id = self.platform_live_id.read().await.clone();
+                let recovered_session_id = self.extra.platform_session_id.read().await.clone();
                 let transition = session_transition(
                     pre_live_status,
                     &recovered_session_id,
@@ -484,26 +703,51 @@ impl DouyinRecorder {
                         self.room_id,
                         self.enabled.load(atomic::Ordering::Relaxed)
                     );
-                    self.reset_live().await;
-                    let _ = self.event_channel.send(RecorderEvent::LiveStart {
-                        recorder: self.info().await,
-                    });
+                    let resuming_recovered_incarnation = !pre_live_status
+                        && !recovered_session_id.is_empty()
+                        && recovered_session_id == info.room_id_str;
+                    if !resuming_recovered_incarnation {
+                        self.reset_live().await;
+                        *self.extra.platform_session_id.write().await = info.room_id_str.clone();
+                        *self.platform_live_id.write().await = new_incarnation_token();
+                    }
+                    self.extra
+                        .live_start_pending
+                        .store(true, atomic::Ordering::Relaxed);
                 }
 
                 if live_status {
-                    let session_changed =
-                        self.platform_live_id.read().await.as_str() != info.room_id_str.as_str();
-                    if session_changed {
-                        (*self.platform_live_id.write().await).clone_from(&info.room_id_str);
+                    if self.extra.platform_session_id.read().await.is_empty() {
+                        *self.extra.platform_session_id.write().await = info.room_id_str.clone();
                     }
+                    if self.platform_live_id.read().await.is_empty() {
+                        *self.platform_live_id.write().await = new_incarnation_token();
+                    }
+                    let marker = ActiveSessionMarker {
+                        version: 1,
+                        platform_session_id: self.extra.platform_session_id.read().await.clone(),
+                        incarnation_token: self.platform_live_id.read().await.clone(),
+                    };
                     // Verify the durable marker on every live poll, not only on
                     // the in-memory transition. A transient bind-mount failure
                     // is therefore retried without restarting the container.
-                    match self.persist_active_session(&info.room_id_str).await {
-                        Ok(()) => self
-                            .extra
-                            .active_session_persist_degraded
-                            .store(false, atomic::Ordering::Relaxed),
+                    // Never start HLS until this succeeds: update_entries can
+                    // run for hours without another status poll.
+                    match self.persist_active_session(&marker).await {
+                        Ok(()) => {
+                            self.extra
+                                .active_session_persist_degraded
+                                .store(false, atomic::Ordering::Relaxed);
+                            if self
+                                .extra
+                                .live_start_pending
+                                .swap(false, atomic::Ordering::Relaxed)
+                            {
+                                let _ = self.event_channel.send(RecorderEvent::LiveStart {
+                                    recorder: self.info().await,
+                                });
+                            }
+                        }
                         Err(error) => {
                             log::error!(
                                 "[{}] Failed to persist Douyin active session {}: {error}",
@@ -525,6 +769,7 @@ impl DouyinRecorder {
                                     },
                                 );
                             }
+                            return false;
                         }
                     }
                 }
@@ -556,6 +801,10 @@ impl DouyinRecorder {
             Err(e) => {
                 log::warn!("[{}]Update room status failed: {}", self.room_id, e);
                 pre_live_status
+                    && !self
+                        .extra
+                        .active_session_persist_degraded
+                        .load(atomic::Ordering::Relaxed)
             }
         }
     }
@@ -581,7 +830,7 @@ impl DouyinRecorder {
                 match pending_live_end_marker_exists(
                     &self.cache_dir,
                     &self.room_id,
-                    &pending.session_id,
+                    &pending.incarnation_token,
                 )
                 .await
                 {
@@ -593,40 +842,41 @@ impl DouyinRecorder {
                     }
                     Err(error) => log::warn!(
                         "Failed to inspect pending Douyin LiveEnd {}: {error}",
-                        pending.session_id
+                        pending.incarnation_token
                     ),
                 }
             } else {
-                match persist_pending_live_end(&self.cache_dir, &self.room_id, &pending.session_id)
-                    .await
-                {
+                let marker = PendingLiveEndMarker {
+                    version: 1,
+                    platform_session_id: pending.platform_session_id.clone(),
+                    incarnation_token: pending.incarnation_token.clone(),
+                };
+                match persist_pending_live_end(&self.cache_dir, &self.room_id, &marker).await {
                     Ok(()) => {
                         pending.marker_persisted = true;
                         self.extra
                             .pending_live_end_persist_degraded
                             .store(false, atomic::Ordering::Relaxed);
-                        let same_id_is_live = self.room_info.read().await.status
-                            && self.platform_live_id.read().await.as_str()
-                                == pending.session_id.as_str();
-                        if !same_id_is_live {
-                            if let Err(error) = clear_active_session_if_matches(
-                                &self.cache_dir,
-                                &self.room_id,
-                                &pending.session_id,
-                            )
-                            .await
-                            {
-                                log::warn!(
-                                    "Failed to clear ended Douyin active session {} during retry: {error}",
-                                    pending.session_id
-                                );
-                            }
+                        // Match the incarnation token, not the provider id. A
+                        // new live is therefore safe even if Douyin reuses the
+                        // same webcast room id.
+                        if let Err(error) = clear_active_session_if_matches(
+                            &self.cache_dir,
+                            &self.room_id,
+                            &pending.incarnation_token,
+                        )
+                        .await
+                        {
+                            log::warn!(
+                                "Failed to clear ended Douyin active session {} during retry: {error}",
+                                pending.incarnation_token
+                            );
                         }
                     }
                     Err(error) => {
                         log::error!(
                             "Failed to persist pending Douyin LiveEnd {}: {error}",
-                            pending.session_id
+                            pending.incarnation_token
                         );
                         if !self
                             .extra
@@ -654,7 +904,7 @@ impl DouyinRecorder {
                 continue;
             }
 
-            let session_id = pending.session_id.clone();
+            let session_id = pending.incarnation_token.clone();
             let mut recorder = self.info().await;
             recorder.platform_live_id.clone_from(&session_id);
             recorder.live_id.clear();
@@ -679,7 +929,7 @@ impl DouyinRecorder {
 
     async fn danmu(&self) -> Result<(), crate::errors::RecorderError> {
         let cookies = self.account.cookies.clone();
-        let platform_live_id = self.platform_live_id.read().await.clone();
+        let platform_live_id = self.extra.platform_session_id.read().await.clone();
         let danmu_room_id = douyin_danmu_room_id(&platform_live_id)?;
         let danmu_stream = DanmuStream::new(ProviderType::Douyin, &cookies, &danmu_room_id)
             .await
@@ -1033,15 +1283,23 @@ impl DouyinRecorder {
         self.stop_danmu().await;
         self.reset_recording().await;
         *self.platform_live_id.write().await = String::new();
+        *self.extra.platform_session_id.write().await = String::new();
+        self.extra
+            .live_start_pending
+            .store(false, atomic::Ordering::Relaxed);
         self.extra.recent_event_ids.lock().await.clear();
         self.extra.pending_event_ids.lock().await.clear();
     }
 
-    async fn persist_active_session(&self, session_id: &str) -> std::io::Result<()> {
-        if session_id.is_empty() {
+    async fn persist_active_session<M>(&self, marker: M) -> std::io::Result<()>
+    where
+        M: Into<ActiveSessionMarker>,
+    {
+        let marker = marker.into();
+        if !marker.is_valid() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "cannot persist an empty Douyin active session id",
+                "cannot persist an empty Douyin active session identity",
             ));
         }
         let _marker_guard = DOUYIN_SESSION_MARKER_LOCK.lock().await;
@@ -1050,21 +1308,29 @@ impl DouyinRecorder {
             tokio::fs::create_dir_all(parent).await?;
         }
         match tokio::fs::read_to_string(&path).await {
-            Ok(current) if current.trim() == session_id => return Ok(()),
+            Ok(current) if parse_active_session_marker(&current).as_ref() == Some(&marker) => {
+                return Ok(())
+            }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
 
         let temporary_path = path.with_file_name(".active-session.tmp");
+        let bytes = serde_json::to_vec(&marker).map_err(std::io::Error::other)?;
         let write_result = async {
             let mut file = tokio::fs::File::create(&temporary_path).await?;
-            file.write_all(session_id.as_bytes()).await?;
+            file.write_all(&bytes).await?;
             file.flush().await?;
             file.sync_data().await?;
             drop(file);
             match tokio::fs::rename(&temporary_path, &path).await {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    if let Some(parent) = path.parent() {
+                        sync_parent_directory(parent).await?;
+                    }
+                    Ok(())
+                }
                 // Windows does not replace an existing destination. Docker's
                 // Linux rename is atomic; this fallback only affects desktop.
                 Err(error)
@@ -1078,7 +1344,8 @@ impl DouyinRecorder {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => return Err(error),
                     }
-                    tokio::fs::rename(&temporary_path, &path).await
+                    tokio::fs::rename(&temporary_path, &path).await?;
+                    Ok(())
                 }
                 Err(error) => Err(error),
             }
@@ -1094,10 +1361,25 @@ impl DouyinRecorder {
         let mut recorder = self.info().await;
         recorder.room_info.status = false;
         let ended_session_id = recorder.platform_live_id.clone();
+        let ended_platform_session_id = {
+            let platform_session_id = self.extra.platform_session_id.read().await.clone();
+            if platform_session_id.is_empty() {
+                // Compatibility for legacy in-memory/test recorders where the
+                // raw id and parent token were the same field.
+                ended_session_id.clone()
+            } else {
+                platform_session_id
+            }
+        };
+        let pending_marker = PendingLiveEndMarker {
+            version: 1,
+            platform_session_id: ended_platform_session_id.clone(),
+            incarnation_token: ended_session_id.clone(),
+        };
         let marker_persisted = match persist_pending_live_end(
             &self.cache_dir,
             &self.room_id,
-            &ended_session_id,
+            &pending_marker,
         )
         .await
         {
@@ -1146,12 +1428,13 @@ impl DouyinRecorder {
             let mut pending = self.extra.pending_live_ends.lock().await;
             if let Some(existing) = pending
                 .iter_mut()
-                .find(|pending| pending.session_id == ended_session_id)
+                .find(|pending| pending.incarnation_token == ended_session_id)
             {
                 existing.marker_persisted |= marker_persisted;
             } else {
                 pending.push_back(PendingLiveEnd {
-                    session_id: ended_session_id.clone(),
+                    platform_session_id: ended_platform_session_id,
+                    incarnation_token: ended_session_id.clone(),
                     marker_persisted,
                 });
             }
@@ -1533,7 +1816,9 @@ mod tests {
         recorder.persist_active_session("session-1").await.unwrap();
         let marker = active_session_path(&cache_dir, "room");
         assert_eq!(
-            tokio::fs::read_to_string(&marker).await.unwrap(),
+            parse_active_session_marker(&tokio::fs::read_to_string(&marker).await.unwrap())
+                .unwrap()
+                .incarnation_token,
             "session-1"
         );
 
@@ -1542,7 +1827,9 @@ mod tests {
         tokio::fs::remove_file(&marker).await.unwrap();
         recorder.persist_active_session("session-1").await.unwrap();
         assert_eq!(
-            tokio::fs::read_to_string(&marker).await.unwrap(),
+            parse_active_session_marker(&tokio::fs::read_to_string(&marker).await.unwrap())
+                .unwrap()
+                .incarnation_token,
             "session-1"
         );
 
@@ -1632,7 +1919,8 @@ mod tests {
         assert_eq!(
             recorder.extra.pending_live_ends.lock().await.as_slices().0,
             &[PendingLiveEnd {
-                session_id: "undelivered-session".to_string(),
+                platform_session_id: "undelivered-session".to_string(),
+                incarnation_token: "undelivered-session".to_string(),
                 marker_persisted: true,
             }]
         );
@@ -1827,32 +2115,45 @@ mod tests {
             "bili-shadowreplay-douyin-same-id-{}",
             uuid::Uuid::new_v4()
         ));
-        persist_pending_live_end(&cache_dir, "room", "reused-session")
+        let old_pending = PendingLiveEndMarker {
+            version: 1,
+            platform_session_id: "reused-session".to_string(),
+            incarnation_token: "old-incarnation".to_string(),
+        };
+        persist_pending_live_end(&cache_dir, "room", &old_pending)
             .await
             .unwrap();
         let marker = active_session_path(&cache_dir, "room");
-        tokio::fs::write(&marker, "reused-session").await.unwrap();
-
-        // Startup recognizes active==pending as the stale half of an interrupted
-        // transition and removes it before accepting a new incarnation.
-        let recorder = test_recorder(cache_dir.clone()).await;
-        assert!(recorder.platform_live_id.read().await.is_empty());
-        assert!(!tokio::fs::try_exists(&marker).await.unwrap());
-
-        recorder
-            .persist_active_session("reused-session")
+        let new_active = ActiveSessionMarker {
+            version: 1,
+            platform_session_id: "reused-session".to_string(),
+            incarnation_token: "new-incarnation".to_string(),
+        };
+        tokio::fs::write(&marker, serde_json::to_vec(&new_active).unwrap())
             .await
             .unwrap();
-        assert!(acknowledge_live_end(&cache_dir, "room", "reused-session").await);
+
+        // The provider id is identical, but distinct incarnation tokens make
+        // the old pending marker and new active marker unambiguous.
+        let recorder = test_recorder(cache_dir.clone()).await;
         assert_eq!(
-            tokio::fs::read_to_string(&marker).await.unwrap(),
+            recorder.platform_live_id.read().await.as_str(),
+            "new-incarnation"
+        );
+        assert_eq!(
+            recorder.extra.platform_session_id.read().await.as_str(),
             "reused-session"
+        );
+        assert!(acknowledge_live_end(&cache_dir, "room", "old-incarnation").await);
+        assert_eq!(
+            parse_active_session_marker(&tokio::fs::read_to_string(&marker).await.unwrap())
+                .unwrap(),
+            new_active
         );
 
         // A delayed pending-marker retry for an old same-ID LiveEnd must not
         // remove the marker belonging to the currently live incarnation.
         recorder.room_info.write().await.status = true;
-        *recorder.platform_live_id.write().await = "reused-session".to_string();
         recorder
             .extra
             .pending_live_ends
@@ -1863,11 +2164,11 @@ mod tests {
             .marker_persisted = false;
         recorder.emit_recovered_pending_live_ends().await;
         assert_eq!(
-            tokio::fs::read_to_string(&marker).await.unwrap(),
-            "reused-session"
+            parse_active_session_marker(&tokio::fs::read_to_string(&marker).await.unwrap())
+                .unwrap(),
+            new_active
         );
-        assert!(acknowledge_live_end(&cache_dir, "room", "reused-session").await);
-        assert!(acknowledge_live_end(&cache_dir, "room", "reused-session").await);
+        assert!(acknowledge_live_end(&cache_dir, "room", "old-incarnation").await);
 
         drop(recorder);
         let _ = tokio::fs::remove_dir_all(cache_dir).await;
@@ -1937,10 +2238,16 @@ impl crate::traits::RecorderTrait<DouyinExtra> for DouyinRecorder {
                     continue;
                 }
 
-                tokio::time::sleep(Duration::from_secs(
-                    self_clone.update_interval.load(atomic::Ordering::Relaxed),
-                ))
-                .await;
+                let retry_secs = if self_clone
+                    .extra
+                    .active_session_persist_degraded
+                    .load(atomic::Ordering::Relaxed)
+                {
+                    2
+                } else {
+                    self_clone.update_interval.load(atomic::Ordering::Relaxed)
+                };
+                tokio::time::sleep(Duration::from_secs(retry_secs)).await;
             }
             log::info!("[{}]Recording thread quit.", self_clone.room_id);
         }));

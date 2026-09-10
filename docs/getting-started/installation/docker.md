@@ -96,6 +96,7 @@ docker compose \
 docker run -d \
   --name bili-shadowreplay \
   --restart unless-stopped \
+  --stop-timeout 60 \
   -p 127.0.0.1:3000:3000 \
   -v "$PWD/data:/app/data" \
   -v "$PWD/cache:/app/cache" \

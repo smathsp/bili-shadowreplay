@@ -67,6 +67,7 @@ test("base Compose is safe and portable while GPU support is optional", () => {
   assert.doesNotMatch(compose, /^\s*WHISPER_MODEL:/m);
   assert.match(gpuCompose, /^\s*devices:/m);
   assert.match(gpuCompose, /\/dev\/dri:\/dev\/dri/);
+  assert.match(dockerDocs, /--stop-timeout\s+60/);
 });
 
 test("Docker workflow builds natively and publishes an atomic manifest", () => {
@@ -82,7 +83,30 @@ test("Docker workflow builds natively and publishes an atomic manifest", () => {
   assert.match(workflow, /Verify GHCR push access/);
   assert.match(workflow, /release_version:/);
   assert.match(workflow, /Docker releases must be dispatched from main/);
+  assert.match(
+    workflow,
+    /registry-preflight:[\s\S]*?actions\/checkout@v7[\s\S]*?require\('\.\/package\.json'\)\.version/,
+  );
   assert.match(workflow, /require\('\.\/package\.json'\)\.version/);
+  assert.match(workflow, /GITHUB_REF_TYPE["']?\s*==\s*["']tag["']/);
+  assert.match(workflow, /tag_version=\$\{GITHUB_REF_NAME#v\}/);
+  assert.match(workflow, /GITHUB_REF_NAME["']?\s*!=\s*v\*/);
+  assert.match(workflow, /tag_version["']?\s*=~\s*\$semver_regex/);
+  assert.match(workflow, /tag_version[\s\S]*?package_version/);
+  assert.match(
+    workflow,
+    /publish_latest:\s*\$\{\{ steps\.validate\.outputs\.publish_latest \}\}/,
+  );
+  assert.equal(
+    workflow.match(
+      /type=raw,value=latest,enable=\$\{\{ needs\.registry-preflight\.outputs\.publish_latest == 'true' \}\}/g,
+    )?.length,
+    2,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /type=raw,value=latest,enable=\$\{\{[^\n]*startsWith\(github\.ref/,
+  );
   assert.match(
     workflow,
     /type=semver,pattern=\{\{version\}\},value=\$\{\{ inputs\.release_version \}\}/,

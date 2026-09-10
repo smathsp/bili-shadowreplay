@@ -47,8 +47,14 @@ jobs:
     name: Verify GHCR push access
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      publish_latest: ${{ steps.validate.outputs.publish_latest }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
       - name: Validate image name and push permission
+        id: validate
         shell: bash
         env:
           GHCR_USER: ${{ github.actor }}
@@ -57,11 +63,34 @@ jobs:
         run: |
           set -euo pipefail
 
+          semver_regex='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
+          package_version=$(node -p "require('./package.json').version")
+          publish_latest=false
+
           if [[ -n "$DOCKER_RELEASE_VERSION" ]] &&
-             [[ ! "$DOCKER_RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+             [[ ! "$DOCKER_RELEASE_VERSION" =~ $semver_regex ]]; then
             echo "Invalid Docker release version: $DOCKER_RELEASE_VERSION" >&2
             echo "Use a semantic version such as 2.22.4 or 2.22.4-rc.1." >&2
             exit 1
+          fi
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag_version=${GITHUB_REF_NAME#v}
+            if [[ "$GITHUB_REF_NAME" != v* ]] || [[ ! "$tag_version" =~ $semver_regex ]]; then
+              echo "Invalid Docker release tag: $GITHUB_REF_NAME" >&2
+              echo "Use a semantic version tag such as v2.22.4 or v2.22.4-rc.1." >&2
+              exit 1
+            fi
+
+            if [[ "$tag_version" != "$package_version" ]]; then
+              echo "Docker release tag $GITHUB_REF_NAME does not match package.json $package_version." >&2
+              exit 1
+            fi
+
+            version_without_build=${tag_version%%+*}
+            if [[ "$version_without_build" != *-* ]]; then
+              publish_latest=true
+            fi
           fi
 
           if [[ -n "$DOCKER_RELEASE_VERSION" ]]; then
@@ -70,12 +99,18 @@ jobs:
               exit 1
             fi
 
-            PACKAGE_VERSION=$(node -p "require('./package.json').version")
-            if [[ "$DOCKER_RELEASE_VERSION" != "$PACKAGE_VERSION" ]]; then
-              echo "Docker release version $DOCKER_RELEASE_VERSION does not match package.json $PACKAGE_VERSION." >&2
+            if [[ "$DOCKER_RELEASE_VERSION" != "$package_version" ]]; then
+              echo "Docker release version $DOCKER_RELEASE_VERSION does not match package.json $package_version." >&2
               exit 1
             fi
+
+            version_without_build=${DOCKER_RELEASE_VERSION%%+*}
+            if [[ "$version_without_build" != *-* ]]; then
+              publish_latest=true
+            fi
           fi
+
+          echo "publish_latest=$publish_latest" >> "$GITHUB_OUTPUT"
 
           if [[ ! "$IMAGE_NAME" =~ ^[a-z0-9._-]+/[a-z0-9._-]+$ ]]; then
             echo "Invalid GHCR image name: $IMAGE_NAME" >&2
@@ -176,7 +211,7 @@ jobs:
             type=semver,pattern={{version}},value=${{ inputs.release_version }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.release_version != '' }}
             type=semver,pattern={{major}}.{{minor}},value=${{ inputs.release_version }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.release_version != '' && !contains(inputs.release_version, '-') }}
             type=semver,pattern={{major}},value=${{ inputs.release_version }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.release_version != '' && !contains(inputs.release_version, '-') }}
-            type=raw,value=latest,enable=${{ (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && inputs.release_version != '' && !contains(inputs.release_version, '-')) }}
+            type=raw,value=latest,enable=${{ needs.registry-preflight.outputs.publish_latest == 'true' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -275,7 +310,7 @@ jobs:
 
   merge:
     name: Publish multi-architecture image
-    needs: build
+    needs: [registry-preflight, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -309,7 +344,7 @@ jobs:
             type=semver,pattern={{version}},value=${{ inputs.release_version }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.release_version != '' }}
             type=semver,pattern={{major}}.{{minor}},value=${{ inputs.release_version }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.release_version != '' && !contains(inputs.release_version, '-') }}
             type=semver,pattern={{major}},value=${{ inputs.release_version }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.release_version != '' && !contains(inputs.release_version, '-') }}
-            type=raw,value=latest,enable=${{ (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && inputs.release_version != '' && !contains(inputs.release_version, '-')) }}
+            type=raw,value=latest,enable=${{ needs.registry-preflight.outputs.publish_latest == 'true' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
