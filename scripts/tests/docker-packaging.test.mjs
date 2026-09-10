@@ -81,6 +81,8 @@ test("Docker workflow builds natively and publishes an atomic manifest", () => {
   assert.match(workflow, /Smoke test image runtime/);
   assert.match(workflow, /Verify GHCR push access/);
   assert.match(workflow, /release_version:/);
+  assert.match(workflow, /Docker releases must be dispatched from main/);
+  assert.match(workflow, /require\('\.\/package\.json'\)\.version/);
   assert.match(
     workflow,
     /type=semver,pattern=\{\{version\}\},value=\$\{\{ inputs\.release_version \}\}/,

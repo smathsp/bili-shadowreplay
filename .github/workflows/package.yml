@@ -64,6 +64,19 @@ jobs:
             exit 1
           fi
 
+          if [[ -n "$DOCKER_RELEASE_VERSION" ]]; then
+            if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "Docker releases must be dispatched from main." >&2
+              exit 1
+            fi
+
+            PACKAGE_VERSION=$(node -p "require('./package.json').version")
+            if [[ "$DOCKER_RELEASE_VERSION" != "$PACKAGE_VERSION" ]]; then
+              echo "Docker release version $DOCKER_RELEASE_VERSION does not match package.json $PACKAGE_VERSION." >&2
+              exit 1
+            fi
+          fi
+
           if [[ ! "$IMAGE_NAME" =~ ^[a-z0-9._-]+/[a-z0-9._-]+$ ]]; then
             echo "Invalid GHCR image name: $IMAGE_NAME" >&2
             echo "Use a lowercase owner/image path in DOCKER_IMAGE_NAME." >&2
