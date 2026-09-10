@@ -19,6 +19,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Verify Docker parity and packaging contracts
+        run: node --test scripts/tests/docker-*.test.mjs
+
       - name: Install system dependencies
         run: |
           sudo apt-get update

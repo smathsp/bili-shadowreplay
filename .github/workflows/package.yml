@@ -3,73 +3,381 @@ name: Docker Build and Push
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - "v*"
+    paths:
+      - ".github/workflows/package.yml"
+      - ".dockerignore"
+      - ".gitmodules"
+      - "Dockerfile"
+      - "package.json"
+      - "yarn.lock"
+      - "index*.html"
+      - "postcss.config.cjs"
+      - "svelte.config.js"
+      - "tailwind.config.js"
+      - "tsconfig*.json"
+      - "vite.config.ts"
+      - "public/**"
+      - "src/**"
+      - "src-tauri/**"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # Set the repository variable DOCKER_IMAGE_NAME to override this path.
+  IMAGE_NAME: ${{ vars.DOCKER_IMAGE_NAME || github.repository }}
 
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+  registry-preflight:
+    name: Verify GHCR push access
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate image name and push permission
+        shell: bash
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$IMAGE_NAME" =~ ^[a-z0-9._-]+/[a-z0-9._-]+$ ]]; then
+            echo "Invalid GHCR image name: $IMAGE_NAME" >&2
+            echo "Use a lowercase owner/image path in DOCKER_IMAGE_NAME." >&2
+            exit 1
+          fi
+
+          token_file=$(mktemp)
+          header_file=$(mktemp)
+          trap 'rm -f "$token_file" "$header_file"' EXIT
+
+          token_status=$(curl --silent --show-error \
+            --output "$token_file" \
+            --write-out '%{http_code}' \
+            --user "${GHCR_USER}:${GHCR_TOKEN}" \
+            "https://${REGISTRY}/token?service=${REGISTRY}&scope=repository:${IMAGE_NAME}:pull,push")
+
+          if [[ "$token_status" != "200" ]]; then
+            echo "GHCR refused a pull/push token (HTTP $token_status)." >&2
+            echo "Open https://github.com/users/${GITHUB_REPOSITORY_OWNER}/packages/container/${IMAGE_NAME#*/}/settings" >&2
+            echo "Under Manage Actions access, add ${GITHUB_REPOSITORY} with Write access." >&2
+            exit 1
+          fi
+
+          registry_token=$(jq -er '.token' "$token_file")
+          echo "::add-mask::$registry_token"
+
+          upload_status=$(curl --silent --show-error \
+            --output /dev/null \
+            --dump-header "$header_file" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer $registry_token" \
+            "https://${REGISTRY}/v2/${IMAGE_NAME}/blobs/uploads/")
+
+          if [[ "$upload_status" != "202" ]]; then
+            echo "GHCR push permission check failed (HTTP $upload_status)." >&2
+            echo "The expensive image build was not started." >&2
+            echo "Open https://github.com/users/${GITHUB_REPOSITORY_OWNER}/packages/container/${IMAGE_NAME#*/}/settings" >&2
+            echo "Under Manage Actions access, add ${GITHUB_REPOSITORY} with Write access." >&2
+            exit 1
+          fi
+
+          upload_location=$(awk 'BEGIN { IGNORECASE=1 } /^location:/ { sub(/\r$/, ""); print $2; exit }' "$header_file")
+          if [[ -n "$upload_location" ]]; then
+            if [[ "$upload_location" == /* ]]; then
+              upload_location="https://${REGISTRY}${upload_location}"
+            fi
+            curl --silent --show-error \
+              --output /dev/null \
+              --request DELETE \
+              --header "Authorization: Bearer $registry_token" \
+              "$upload_location" || true
+          fi
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: registry-preflight
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      - name: Log in to the Container registry
-        uses: docker/login-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
+      - name: Extract image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: latest=false
           tags: |
             type=sha,format=long
             type=ref,event=branch
-            type=ref,event=pr
+            type=ref,event=tag
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=semver,pattern={{major}},enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
-      - name: Set cache image
-        id: cache
-        shell: bash
-        run: echo "image=${REGISTRY}/${IMAGE_NAME,,}:buildcache" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Build and push image by digest
+        id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=${{ steps.cache.outputs.image }}
-          cache-to: type=registry,ref=${{ steps.cache.outputs.image }},mode=max
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }},ignore-error=true
+          provenance: mode=max
           build-args: |
             SENTRY_ENDPOINT=${{ secrets.SENTRY_ENDPOINT }}
 
-      - name: Upload debug symbols to Sentry
-        # Requires repository secrets: SENTRY_URL, SENTRY_AUTH_TOKEN, SENTRY_ORG, SENTRY_PROJECT
+      - name: Smoke test image runtime
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid image digest: $IMAGE_DIGEST" >&2
+            exit 1
+          fi
+
+          image="${REGISTRY}/${IMAGE_NAME}@${IMAGE_DIGEST}"
+          docker pull --platform "$PLATFORM" "$image"
+
+          docker run --rm \
+            --platform "$PLATFORM" \
+            --entrypoint sh \
+            "$image" \
+            -ec 'test -s /app/silero_vad.onnx; ffmpeg -version > /tmp/ffmpeg-version; head -n 1 /tmp/ffmpeg-version'
+
+          container_id=""
+          cleanup_container() {
+            if [[ -n "$container_id" ]]; then
+              docker rm -f "$container_id" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_container EXIT
+
+          container_id=$(docker run --detach \
+            --platform "$PLATFORM" \
+            --publish 127.0.0.1:3000:3000 \
+            "$image")
+
+          health_response=""
+          for attempt in {1..30}; do
+            if health_response=$(curl --fail --silent --show-error --max-time 2 \
+              http://127.0.0.1:3000/api/health 2>/dev/null); then
+              break
+            fi
+
+            if [[ $(docker inspect --format '{{.State.Running}}' "$container_id") != "true" ]]; then
+              echo "Container exited before becoming healthy." >&2
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ -z "$health_response" ]] || ! jq -e \
+            '.code == 0 and .data.status == "ok"' <<< "$health_response" >/dev/null; then
+            echo "Health endpoint did not return a successful response." >&2
+            docker logs "$container_id" >&2 || true
+            exit 1
+          fi
+
+          echo "Runtime smoke test passed for $PLATFORM."
+
+      - name: Save image digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest='${{ steps.build.outputs.digest }}'
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid image digest: $digest" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$digest" > "$RUNNER_TEMP/digests/${{ matrix.arch }}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish multi-architecture image
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Download image digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: docker-digest-*
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: latest=false
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=semver,pattern={{major}},enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Create multi-architecture manifest
+        id: manifest
+        shell: bash
+        env:
+          TAGS_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          set -euo pipefail
+
+          image="${REGISTRY}/${IMAGE_NAME}"
+          amd64_digest=$(tr -d '\r\n' < "$RUNNER_TEMP/digests/amd64")
+          arm64_digest=$(tr -d '\r\n' < "$RUNNER_TEMP/digests/arm64")
+
+          for digest in "$amd64_digest" "$arm64_digest"; do
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "Invalid image digest: $digest" >&2
+              exit 1
+            fi
+          done
+
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$TAGS_JSON")
+          if (( ${#tags[@]} == 0 )); then
+            echo "Docker metadata did not produce any tags." >&2
+            exit 1
+          fi
+
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=(--tag "$tag")
+          done
+
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            "$image@$amd64_digest" \
+            "$image@$arm64_digest"
+
+          echo "primary-tag=${tags[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify published architectures
+        shell: bash
+        env:
+          PRIMARY_TAG: ${{ steps.manifest.outputs.primary-tag }}
+        run: |
+          set -euo pipefail
+
+          manifest_file=$(mktemp)
+          trap 'rm -f "$manifest_file"' EXIT
+
+          for attempt in {1..6}; do
+            if docker buildx imagetools inspect --raw "$PRIMARY_TAG" > "$manifest_file" 2>/dev/null; then
+              break
+            fi
+            if [[ "$attempt" == "6" ]]; then
+              echo "Published manifest was not readable after retrying." >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+          jq -r '
+            .manifests[]
+            | select(.platform.os == "linux")
+            | select(.platform.architecture == "amd64" or .platform.architecture == "arm64")
+            | "\(.platform.os)/\(.platform.architecture)"
+          ' "$manifest_file" | sort -u > "$RUNNER_TEMP/published-platforms"
+
+          grep -Fxq 'linux/amd64' "$RUNNER_TEMP/published-platforms"
+          grep -Fxq 'linux/arm64' "$RUNNER_TEMP/published-platforms"
+          if [[ $(wc -l < "$RUNNER_TEMP/published-platforms") -ne 2 ]]; then
+            echo "Unexpected platform manifest:" >&2
+            cat "$RUNNER_TEMP/published-platforms" >&2
+            exit 1
+          fi
+
+          echo "Verified $PRIMARY_TAG for linux/amd64 and linux/arm64."
+
+      - name: Verify anonymous pull access
+        shell: bash
+        env:
+          PRIMARY_TAG: ${{ steps.manifest.outputs.primary-tag }}
+        run: |
+          set -euo pipefail
+
+          tag="${PRIMARY_TAG##*:}"
+          anonymous_token=$(curl --fail --silent --show-error \
+            "https://${REGISTRY}/token?service=${REGISTRY}&scope=repository:${IMAGE_NAME}:pull" \
+            | jq -er '.token')
+
+          curl --fail --silent --show-error \
+            --output /dev/null \
+            --header "Authorization: Bearer $anonymous_token" \
+            --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/${tag}"
+
+          echo "Verified that $PRIMARY_TAG is publicly pullable."
+
+      - name: Upload AMD64 debug symbols to Sentry
         continue-on-error: true
         shell: bash
         env:
@@ -79,17 +387,18 @@ jobs:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${SENTRY_AUTH_TOKEN:-}" ]; then
+          if [[ -z "${SENTRY_AUTH_TOKEN:-}" ]]; then
             echo "SENTRY_AUTH_TOKEN not set, skipping debug symbol upload."
             exit 0
           fi
-          # The headless Linux binary keeps DWARF embedded (profile.release debug = 1).
-          # Pull the just-pushed image and extract the binary to upload its debug info.
-          IMAGE=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
-          echo "Extracting binary from image: $IMAGE"
-          docker pull "$IMAGE"
+
+          amd64_digest=$(tr -d '\r\n' < "$RUNNER_TEMP/digests/amd64")
+          image="${REGISTRY}/${IMAGE_NAME}@${amd64_digest}"
+          echo "Extracting AMD64 debug binary from $image"
+
+          docker pull --platform linux/amd64 "$image"
           mkdir -p debug-files
-          CID=$(docker create "$IMAGE")
-          docker cp "$CID:/app/bili-shadowreplay" debug-files/bili-shadowreplay
-          docker rm "$CID"
+          container_id=$(docker create --platform linux/amd64 "$image")
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container_id:/app/bili-shadowreplay" debug-files/bili-shadowreplay
           npx --yes @sentry/cli@2 debug-files upload debug-files

@@ -1,28 +1,35 @@
+name: bili-shadowreplay
+
 services:
-    Bilibili_ShadowReplay:
-        image: ghcr.io/xinrea/bili-shadowreplay:latest
-        container_name: Bili_ShadowReplay
-        restart: unless-stopped
-        devices:
-            - /dev/dri:/dev/dri
-        networks:
-            - stream_replay
-        ports:
-            - "3000:3000"
-        volumes:
-            - ./data:/app/data
-            - ./cache:/app/cache
-            - ./output:/app/output
-            - ./whisper_model.bin:/app/whisper_model.bin
-        environment:
-            DATA_DIR: /app/data
-            CONFIG_PATH: /app/data/config.toml
-            CACHE_DIR: /app/cache
-            OUTPUT_DIR: /app/output
-            LOG_DIR: /app/data/logs
-            WHISPER_MODEL: /app/whisper_model.bin
-
-
-networks:
-    stream_replay:
-        driver: bridge
+  bili-shadowreplay:
+    image: ${BILI_SHADOWREPLAY_IMAGE:-ghcr.io/smathsp/bili-shadowreplay:latest}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      # The Web API has no built-in authentication, so keep it local by default.
+      # Set BSR_BIND_ADDRESS=0.0.0.0 only for a trusted LAN or an authenticated proxy.
+      - "${BSR_BIND_ADDRESS:-127.0.0.1}:${BSR_PORT:-3000}:3000"
+    volumes:
+      - ./data:/app/data
+      - ./cache:/app/cache
+      - ./output:/app/output
+      # Put optional Whisper model files here, then select /app/models/<file> in Settings.
+      - ./models:/app/models
+    environment:
+      DATA_DIR: /app/data
+      CONFIG_PATH: /app/data/config.toml
+      CACHE_DIR: /app/cache
+      OUTPUT_DIR: /app/output
+      LOG_DIR: /app/data/logs
+      TZ: ${TZ:-Asia/Shanghai}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3

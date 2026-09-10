@@ -62,9 +62,10 @@ use crate::{
 };
 use axum::extract::Query;
 use axum::{
-    extract::{DefaultBodyLimit, Json, Multipart, Path},
+    body::Body,
+    extract::{DefaultBodyLimit, Json, Multipart, Path, Request},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -78,6 +79,7 @@ use recorder::{
     RecorderInfo,
 };
 use serde::{Deserialize, Serialize};
+use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
@@ -2016,26 +2018,130 @@ async fn handler_hls(
 
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024 * 1024;
 
+#[derive(Clone, Copy)]
+enum StorageDirectory {
+    Cache,
+    Output,
+}
+
+impl StorageDirectory {
+    fn mount_prefix(self) -> &'static str {
+        match self {
+            Self::Cache => "/cache",
+            Self::Output => "/output",
+        }
+    }
+
+    fn configured_path(self, config: &Config) -> PathBuf {
+        match self {
+            Self::Cache => PathBuf::from(&config.cache),
+            Self::Output => PathBuf::from(&config.output),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HealthStatus {
+    status: &'static str,
+    version: &'static str,
+}
+
+async fn handler_health() -> Json<ApiResponse<HealthStatus>> {
+    Json(ApiResponse::success(HealthStatus {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+fn rewrite_storage_request_uri(
+    request: &mut Request,
+    mount_prefix: &str,
+) -> Result<(), StatusCode> {
+    let path = request.uri().path();
+    let relative_path = if path == mount_prefix {
+        "/"
+    } else {
+        path.strip_prefix(mount_prefix)
+            .filter(|remainder| remainder.starts_with('/'))
+            .ok_or(StatusCode::NOT_FOUND)?
+    };
+
+    // Keep the original percent-encoding intact and let ServeDir perform its
+    // normal path validation. Decoding and joining the wildcard ourselves
+    // would risk turning encoded separators or `..` components into traversal.
+    let rewritten = match request.uri().query() {
+        Some(query) => format!("{relative_path}?{query}"),
+        None => relative_path.to_string(),
+    };
+    *request.uri_mut() = rewritten.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(())
+}
+
+async fn serve_storage_directory(
+    root: PathBuf,
+    mount_prefix: &'static str,
+    mut request: Request,
+) -> Response {
+    if request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+
+    if let Err(status) = rewrite_storage_request_uri(&mut request, mount_prefix) {
+        return status.into_response();
+    }
+
+    match ServeDir::new(root).oneshot(request).await {
+        Ok(response) => response.map(Body::new),
+        Err(error) => match error {},
+    }
+}
+
+async fn serve_configured_storage(
+    state: State,
+    directory: StorageDirectory,
+    request: Request,
+) -> Response {
+    // Resolve the directory for every request. The Web settings API can change
+    // cache/output paths while the server is running, so a ServeDir captured at
+    // startup would keep serving the old location until a container restart.
+    let root = {
+        let config = state.config.read().await;
+        directory.configured_path(&config)
+    };
+
+    serve_storage_directory(root, directory.mount_prefix(), request).await
+}
+
+async fn handler_cache_files(state: axum::extract::State<State>, request: Request) -> Response {
+    serve_configured_storage(state.0, StorageDirectory::Cache, request).await
+}
+
+async fn handler_output_files(state: axum::extract::State<State>, request: Request) -> Response {
+    serve_configured_storage(state.0, StorageDirectory::Output, request).await
+}
+
 pub async fn start_api_server(state: State) {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // In headless/Docker mode, serve cache and output from the same port (3000) so they are
-    // reachable when only one port is exposed. These routes must be registered before "/".
-    //
-    // Take a single read lock on config and clone the relevant fields to avoid
-    // redundant locking. The lock is scoped to this block so it is released
-    // before we move `state` into the router below.
-    let (output_path, cache_path) = {
-        let config = state.config.read().await;
-        (config.output.clone(), config.cache.clone())
-    };
-
     let mut app = Router::new()
-        .nest_service("/output", ServeDir::new(output_path))
-        .nest_service("/cache", ServeDir::new(cache_path))
+        .route("/api/health", get(handler_health))
+        .route(
+            "/output",
+            get(handler_output_files).head(handler_output_files),
+        )
+        .route(
+            "/output/*path",
+            get(handler_output_files).head(handler_output_files),
+        )
+        .route("/cache", get(handler_cache_files).head(handler_cache_files))
+        .route(
+            "/cache/*path",
+            get(handler_cache_files).head(handler_cache_files),
+        )
         // Serve static files from dist directory
         .nest_service("/", ServeDir::new("./dist"))
         // Account commands
@@ -2290,6 +2396,29 @@ pub async fn start_api_server(state: State) {
 mod tests {
     use super::*;
 
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "bsr-http-storage-test-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(path.join("served")).unwrap();
+            Self(path)
+        }
+
+        fn served(&self) -> PathBuf {
+            self.0.join("served")
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn auto_generate_request_uses_frontend_field_names() {
         let request: UpdateAutoGenerateRequest = serde_json::from_value(serde_json::json!({
@@ -2299,5 +2428,89 @@ mod tests {
         .unwrap();
         assert!(request.enabled);
         assert!(request.encode_danmu);
+    }
+
+    #[tokio::test]
+    async fn health_response_reports_version() {
+        let response = handler_health().await.0;
+        assert_eq!(response.code, 0);
+        let health = response.data.unwrap();
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn storage_uri_rewrite_preserves_encoding_and_query() {
+        let mut request = Request::builder()
+            .uri("/output/folder/clip%20one.mp4?download=1")
+            .body(Body::empty())
+            .unwrap();
+
+        rewrite_storage_request_uri(&mut request, "/output").unwrap();
+
+        assert_eq!(
+            request.uri().to_string(),
+            "/folder/clip%20one.mp4?download=1"
+        );
+    }
+
+    #[test]
+    fn storage_uri_rewrite_rejects_prefix_lookalike() {
+        let mut request = Request::builder()
+            .uri("/output-other/file.mp4")
+            .body(Body::empty())
+            .unwrap();
+
+        assert_eq!(
+            rewrite_storage_request_uri(&mut request, "/output"),
+            Err(StatusCode::NOT_FOUND)
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_service_supports_get_and_head() {
+        let directory = TestDirectory::new();
+        std::fs::write(directory.served().join("clip one.mp4"), b"video-data").unwrap();
+
+        let get_request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/output/clip%20one.mp4")
+            .body(Body::empty())
+            .unwrap();
+        let get_response =
+            serve_storage_directory(directory.served(), "/output", get_request).await;
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_body = axum::body::to_bytes(get_response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&get_body[..], b"video-data");
+
+        let head_request = Request::builder()
+            .method(axum::http::Method::HEAD)
+            .uri("/output/clip%20one.mp4")
+            .body(Body::empty())
+            .unwrap();
+        let head_response =
+            serve_storage_directory(directory.served(), "/output", head_request).await;
+        assert_eq!(head_response.status(), StatusCode::OK);
+        let head_body = axum::body::to_bytes(head_response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(head_body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn storage_service_blocks_parent_traversal() {
+        let directory = TestDirectory::new();
+        std::fs::write(directory.0.join("secret.txt"), b"secret").unwrap();
+
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/output/%2e%2e/secret.txt")
+            .body(Body::empty())
+            .unwrap();
+        let response = serve_storage_directory(directory.served(), "/output", request).await;
+
+        assert!(!response.status().is_success());
     }
 }

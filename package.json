@@ -1,7 +1,7 @@
 {
   "name": "bili-shadowreplay",
   "private": true,
-  "version": "2.22.2",
+  "version": "2.22.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,6 +10,7 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test:agent": "node --experimental-vm-modules --test scripts/tests/agent-attachments.test.mjs",
     "test:docker-parity": "node --test scripts/tests/docker-api-parity.test.mjs",
+    "test:docker": "node --test scripts/tests/docker-*.test.mjs",
     "tauri": "tauri",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",

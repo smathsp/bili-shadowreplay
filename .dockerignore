@@ -13,6 +13,15 @@ build
 target
 *.log
 
+# Documentation, CI metadata and local test fixtures are not needed by the
+# production image. The Rust fixtures include a large Whisper test model.
+docs
+.github
+.devcontainer
+test_output
+test_videos
+src-tauri/tests
+
 # Version control
 .git
 .gitignore
@@ -28,6 +37,20 @@ target
 .env
 .env.local
 .env.*.local
+
+# Runtime state and user-provided data. Docker does not read nested .gitignore
+# files, so these must be excluded explicitly to keep them out of remote caches.
+data
+cache
+output
+logs
+whisper_model.bin
+src-tauri/config.toml
+src-tauri/cache
+src-tauri/output
+src-tauri/tmps
+src-tauri/clips
+src-tauri/data
 
 # Debug files
 npm-debug.log*

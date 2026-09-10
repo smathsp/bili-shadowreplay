@@ -40,3 +40,9 @@ docs/.vitepress/dist
 *.debug.map
 
 .cargo
+
+# Local Docker Compose state
+/data/
+/cache/
+/output/
+/models/

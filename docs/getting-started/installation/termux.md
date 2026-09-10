@@ -29,7 +29,7 @@ mkdir -p "$HOME/bsr"/{data,cache,output}
 proot-distro install \
   --name bili-shadowreplay \
   --architecture linux/arm64 \
-  ghcr.io/xinrea/bili-shadowreplay:latest
+  ghcr.io/smathsp/bili-shadowreplay:latest
 ```
 
 `proot-distro` 会根据镜像清单拉取 ARM64 版本，不会在手机上模拟 x86。
@@ -45,7 +45,7 @@ proot-distro login bili-shadowreplay \
   --bind "$HOME/bsr/data:/app/data" \
   --bind "$HOME/bsr/cache:/app/cache" \
   --bind "$HOME/bsr/output:/app/output" \
-  -- /bin/sh -lc 'cd /app && exec ./bili-shadowreplay'
+  -- /bin/sh -lc 'cd /app && nscd && exec ./bili-shadowreplay'
 ```
 
 服务启动后，在手机浏览器中打开 <http://127.0.0.1:3000>。这里不需要 Docker

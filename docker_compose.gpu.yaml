@@ -1,0 +1,5 @@
+services:
+  bili-shadowreplay:
+    # Optional Intel/AMD VAAPI acceleration on Linux.
+    devices:
+      - /dev/dri:/dev/dri
