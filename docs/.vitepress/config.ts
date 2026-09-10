@@ -1,8 +1,11 @@
 import { defineConfig } from "vitepress";
 import { withMermaid } from "vitepress-plugin-mermaid";
 
+const githubRepository = process.env.GITHUB_REPOSITORY ?? "Xinrea/bili-shadowreplay";
+
 // https://vitepress.dev/reference/site-config
 export default withMermaid({
+  base: process.env.VITEPRESS_BASE ?? "/",
   title: "BiliBili ShadowReplay",
   description: "直播录制/实时回放/剪辑/投稿工具",
   themeConfig: {
@@ -11,7 +14,7 @@ export default withMermaid({
       { text: "Home", link: "/" },
       {
         text: "Releases",
-        link: "https://github.com/Xinrea/bili-shadowreplay/releases",
+        link: `https://github.com/${githubRepository}/releases`,
       },
     ],
 
