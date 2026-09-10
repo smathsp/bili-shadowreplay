@@ -21,7 +21,7 @@ BiliBili ShadowReplay 是一个缓存直播并进行实时编辑投稿的工具�
 
 ![rooms](docs/public/images/summary.png)
 
-前往网站查看说明：[BiliBili ShadowReplay](https://bsr.xinrea.cn/)
+前往网站查看说明：[BiliBili ShadowReplay](https://smathsp.github.io/bili-shadowreplay/)
 
 Docker 成品镜像：`ghcr.io/smathsp/bili-shadowreplay:latest`，部署方法见
 [Docker 部署说明](docs/getting-started/installation/docker.md)。
