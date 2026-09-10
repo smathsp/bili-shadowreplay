@@ -217,7 +217,6 @@ jobs:
               --workflow package.yml \
               --branch "$GITHUB_REF_NAME" \
               --commit "$GITHUB_SHA" \
-              --event push \
               --limit 1 \
               --json status,conclusion \
               --jq 'if length == 0 then "missing" else "\(.[0].status) \(.[0].conclusion)" end')
