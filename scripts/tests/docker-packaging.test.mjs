@@ -6,13 +6,21 @@ async function read(relativePath) {
   return readFile(new URL(`../../${relativePath}`, import.meta.url), "utf8");
 }
 
-const [dockerfile, dockerignore, compose, gpuCompose, workflow, dockerDocs] =
-  await Promise.all([
+const [
+  dockerfile,
+  dockerignore,
+  compose,
+  gpuCompose,
+  workflow,
+  releaseWorkflow,
+  dockerDocs,
+] = await Promise.all([
     read("Dockerfile"),
     read(".dockerignore"),
     read("docker_compose.yaml"),
     read("docker_compose.gpu.yaml"),
     read(".github/workflows/package.yml"),
+    read(".github/workflows/main.yml"),
     read("docs/getting-started/installation/docker.md"),
   ]);
 
@@ -72,6 +80,18 @@ test("Docker workflow builds natively and publishes an atomic manifest", () => {
   assert.match(workflow, /Verify published architectures/);
   assert.match(workflow, /Smoke test image runtime/);
   assert.match(workflow, /Verify GHCR push access/);
+});
+
+test("Release workflow only builds tags and has full history for changelogs", () => {
+  assert.match(
+    releaseWorkflow,
+    /publish-tauri:\s*\n\s*if: startsWith\(github\.ref, 'refs\/tags\/v'\)/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /actions\/checkout@v7[\s\S]*?fetch-depth:\s*0/,
+  );
+  assert.match(releaseWorkflow, /Wait for the matching Docker image/);
 });
 
 test("Docker documentation points to the published custom image", () => {

@@ -6,6 +6,7 @@ on:
       - "v*"
 jobs:
   publish-tauri:
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     strategy:
@@ -35,9 +36,10 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
+          fetch-depth: 0
 
       - name: Set build type
         id: build_type
