@@ -40,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     glib-2.0-dev \
     libclang-dev \
+    make \
     g++ \
     wget \
     xz-utils \

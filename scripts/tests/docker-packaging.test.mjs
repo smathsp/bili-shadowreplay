@@ -23,6 +23,17 @@ test("runtime image contains required assets and health tooling", () => {
   assert.doesNotMatch(dockerfile, /^COPY \. \.$/m);
 });
 
+test("Rust image contains the native build tools required by CMake", () => {
+  const rustBase = dockerfile.match(
+    /FROM rust:[\s\S]*?(?=\nFROM rust-base AS rust-planner)/,
+  )?.[0];
+
+  assert.ok(rustBase, "rust-base stage should exist");
+  assert.match(rustBase, /^\s*cmake \\/m);
+  assert.match(rustBase, /^\s*make \\/m);
+  assert.match(rustBase, /^\s*g\+\+ \\/m);
+});
+
 test("Docker context excludes local data and large test fixtures", () => {
   for (const ignoredPath of [
     "docs",
