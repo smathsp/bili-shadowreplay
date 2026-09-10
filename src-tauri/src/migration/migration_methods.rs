@@ -21,6 +21,18 @@ async fn archived_file_size(path: &std::path::Path) -> Result<u64, std::io::Erro
     Ok(size)
 }
 
+async fn has_nonempty_douyin_danmu(path: &std::path::Path) -> bool {
+    for file_name in ["events.jsonl", "danmu.txt"] {
+        if tokio::fs::metadata(path.join(file_name))
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub async fn try_rebuild_archives(
     db: &Arc<Database>,
     cache_path: PathBuf,
@@ -75,23 +87,56 @@ pub async fn try_rebuild_archives(
                         .ok()
                         .filter(|metadata| metadata.is_file() && metadata.len() > 0)
                         .map(|metadata| metadata.len());
-                    let Some(playlist_size) = playlist_size else {
+                    if let Some(playlist_size) = playlist_size {
+                        (
+                            0.0,
+                            archived_file_size(&record_path).await?.max(playlist_size),
+                        )
+                    } else if platform == PlatformType::Douyin
+                        && has_nonempty_douyin_danmu(&record_path).await
+                    {
+                        // A crash can happen after events.jsonl is created but
+                        // before RecordStart reaches the database or any video
+                        // segment is committed. Keep the attempt discoverable
+                        // for full-danmu export, but size=0 must continue to mean
+                        // that no playable archive exists for auto generation.
+                        log::info!(
+                            "rebuilding danmu-only Douyin archive: {}",
+                            record_path.display()
+                        );
+                        (0.0, 0)
+                    } else {
                         log::warn!(
-                            "preserving archive directory without readable entries or playlist: {}",
+                            "preserving archive directory without readable entries, playlist, or Douyin danmu: {}",
                             record_path.display()
                         );
                         continue;
-                    };
-                    (
-                        0.0,
-                        archived_file_size(&record_path).await?.max(playlist_size),
-                    )
+                    }
                 } else {
                     (entry_store.total_duration(), entry_store.total_size())
                 };
 
+                // A per-attempt marker is authoritative. In particular, an
+                // archive row may already exist from a previous startup where
+                // the session relationship was not known yet. Repair that row
+                // before recovered LiveEnd handling queries by parent id.
+                let persisted_session_parent = if platform == PlatformType::Douyin {
+                    tokio::fs::read_to_string(record_path.join(DOUYIN_SESSION_PARENT_FILE))
+                        .await
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                } else {
+                    None
+                };
+
                 // check if live_id is in db
                 if let Ok(record) = existing_record {
+                    if let Some(parent_id) = persisted_session_parent.as_deref() {
+                        if record.parent_id != parent_id {
+                            db.update_record_parent_id(&live_id, parent_id).await?;
+                        }
+                    }
                     if record.size == 0 {
                         db.update_record_delta(&live_id, archive_duration, archive_size)
                             .await?;
@@ -101,12 +146,7 @@ pub async fn try_rebuild_archives(
 
                 // create a record for this live_id
                 let persisted_parent = if platform == PlatformType::Douyin {
-                    tokio::fs::read_to_string(record_path.join(DOUYIN_SESSION_PARENT_FILE))
-                        .await
-                        .ok()
-                        .map(|value| value.trim().to_string())
-                        .filter(|value| !value.is_empty())
-                        .or_else(|| active_session_parent.clone())
+                    persisted_session_parent.or_else(|| active_session_parent.clone())
                 } else {
                     None
                 };
@@ -252,4 +292,142 @@ pub async fn try_convert_entry_to_m3u8(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn migration_database() -> Arc<Database> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE recorders (
+                room_id TEXT PRIMARY KEY, created_at TEXT, platform TEXT,
+                auto_start INTEGER, extra TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE records (
+                live_id TEXT PRIMARY KEY, platform TEXT, parent_id TEXT,
+                room_id TEXT, title TEXT, length REAL, size INTEGER,
+                created_at TEXT, cover TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let db = Arc::new(Database::new());
+        db.set(pool).await;
+        db
+    }
+
+    #[tokio::test]
+    async fn rebuild_repairs_existing_douyin_parent_from_attempt_marker() {
+        let db = migration_database().await;
+        db.add_recorder(PlatformType::Douyin, "room", "")
+            .await
+            .unwrap();
+        db.add_record(
+            PlatformType::Douyin,
+            "attempt-1",
+            "attempt-1",
+            "room",
+            "old row",
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_record_delta("attempt-1", 1.0, 1).await.unwrap();
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "bili-shadowreplay-parent-rebuild-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let attempt_dir = cache_dir
+            .join(PlatformType::Douyin.as_str())
+            .join("room")
+            .join("attempt-1");
+        tokio::fs::create_dir_all(&attempt_dir).await.unwrap();
+        tokio::fs::write(attempt_dir.join("playlist.m3u8"), "#EXTM3U\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            attempt_dir.join(DOUYIN_SESSION_PARENT_FILE),
+            "session-parent",
+        )
+        .await
+        .unwrap();
+
+        try_rebuild_archives(&db, cache_dir.clone()).await.unwrap();
+
+        let repaired = db.get_record("room", "attempt-1").await.unwrap();
+        assert_eq!(repaired.parent_id, "session-parent");
+        let _ = tokio::fs::remove_dir_all(cache_dir).await;
+    }
+
+    #[tokio::test]
+    async fn rebuild_keeps_douyin_danmu_only_attempts_at_zero_video_size() {
+        let db = migration_database().await;
+        db.add_recorder(PlatformType::Douyin, "room", "")
+            .await
+            .unwrap();
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "bili-shadowreplay-danmu-only-rebuild-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let room_dir = cache_dir.join(PlatformType::Douyin.as_str()).join("room");
+        for (live_id, file_name) in [
+            ("jsonl-attempt", "events.jsonl"),
+            ("legacy-attempt", "danmu.txt"),
+        ] {
+            let attempt_dir = room_dir.join(live_id);
+            tokio::fs::create_dir_all(&attempt_dir).await.unwrap();
+            tokio::fs::write(
+                attempt_dir.join(DOUYIN_SESSION_PARENT_FILE),
+                "session-parent",
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(attempt_dir.join(file_name), "saved danmu\n")
+                .await
+                .unwrap();
+        }
+
+        let empty_attempt = room_dir.join("empty-attempt");
+        tokio::fs::create_dir_all(&empty_attempt).await.unwrap();
+        tokio::fs::write(
+            empty_attempt.join(DOUYIN_SESSION_PARENT_FILE),
+            "session-parent",
+        )
+        .await
+        .unwrap();
+
+        try_rebuild_archives(&db, cache_dir.clone()).await.unwrap();
+
+        let archives = db
+            .get_archives_by_parent_id("room", "session-parent")
+            .await
+            .unwrap();
+        assert_eq!(archives.len(), 2);
+        let mut live_ids = archives
+            .iter()
+            .map(|archive| archive.live_id.as_str())
+            .collect::<Vec<_>>();
+        live_ids.sort_unstable();
+        assert_eq!(live_ids, ["jsonl-attempt", "legacy-attempt"]);
+        assert!(archives
+            .iter()
+            .all(|archive| archive.size == 0 && archive.length == 0.0));
+        assert!(db.get_record("room", "empty-attempt").await.is_err());
+        let _ = tokio::fs::remove_dir_all(cache_dir).await;
+    }
 }

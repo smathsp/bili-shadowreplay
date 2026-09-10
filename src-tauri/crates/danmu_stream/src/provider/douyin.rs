@@ -1,5 +1,7 @@
 mod messages;
 
+use std::collections::VecDeque;
+use std::future::Future;
 use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,7 +11,7 @@ use deno_core::v8;
 use deno_core::JsRuntime;
 use deno_core::RuntimeOptions;
 use flate2::read::GzDecoder;
-use futures_util::{SinkExt, StreamExt, TryStreamExt};
+use futures_util::{SinkExt, Stream, StreamExt};
 use log::debug;
 use log::{error, info};
 use messages::*;
@@ -36,6 +38,8 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const WEBSOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_PAYLOAD: &[u8] = &[0x3A, 0x02, 0x68, 0x62];
+const MAX_PENDING_FRAMES: usize = 128;
+const MAX_PENDING_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 type WsReadType = futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 type WsWriteType =
@@ -143,83 +147,13 @@ impl DouyinDanmu {
 
     async fn handle_connection(
         &self,
-        mut read: WsReadType,
+        read: WsReadType,
         tx: mpsc::Sender<DanmuMessageType>,
     ) -> Result<(), DanmuStreamError> {
-        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // `interval` ticks immediately once. Consume that tick so the first
-        // heartbeat is sent after the configured interval.
-        heartbeat.tick().await;
-
-        loop {
-            if *self.stop.read().await {
-                info!("Stopping douyin danmu stream");
-                break;
-            }
-            tokio::select! {
-                _ = heartbeat.tick() => {
-                    if *self.stop.read().await {
-                        info!("Stopping douyin danmu stream");
-                        break;
-                    }
-                    self.send_ws_message(Self::heartbeat_message(), "heartbeat").await?;
-                }
-                message = read.try_next() => {
-                    let Some(message) = message.map_err(|error| {
-                        DanmuStreamError::WebsocketError {
-                            err: format!("Failed to read message: {error}"),
-                        }
-                    })? else {
-                        info!("Douyin WebSocket stream ended");
-                        break;
-                    };
-
-                    match message {
-                        WsMessage::Binary(data) => {
-                            let (ack, events) = decode_binary_message(&data, &self.room_id)?;
-                            // Hand every decoded event to the bounded recorder
-                            // queue before acknowledging the frame. During
-                            // backpressure `forward_event` keeps the connection
-                            // alive with heartbeats, and a crash leaves the frame
-                            // unacknowledged so Douyin may replay it on reconnect.
-                            let has_events = !events.is_empty();
-                            for event in events {
-                                self.forward_event(&tx, event, &mut heartbeat).await?;
-                            }
-                            if ack.is_some() && has_events {
-                                self.wait_for_persistence(&tx, &mut heartbeat).await?;
-                            }
-                            if let Some(ack) = ack {
-                                if *self.stop.read().await {
-                                    // The frame was already received before
-                                    // shutdown. Persist it, but do not ACK a
-                                    // connection which is being closed.
-                                    info!("Stopping douyin danmu stream after final frame");
-                                    break;
-                                } else {
-                                    self.send_ws_message(
-                                        WsMessage::binary(ack.encode_to_vec()),
-                                        "ack",
-                                    )
-                                    .await?;
-                                }
-                            }
-                        }
-                        WsMessage::Close(_) => {
-                            info!("WebSocket connection closed");
-                            break;
-                        }
-                        WsMessage::Ping(data) => {
-                            self.send_ws_message(WsMessage::Pong(data), "pong").await?;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        pump_connection(read, tx, &self.room_id, &self.stop, |message| {
+            self.send_ws_message(message, "control")
+        })
+        .await
     }
 
     fn heartbeat_message() -> WsMessage {
@@ -249,68 +183,149 @@ impl DouyinDanmu {
             }),
         }
     }
+}
 
-    async fn forward_event(
-        &self,
-        tx: &mpsc::Sender<DanmuMessageType>,
-        event: DanmuMessageType,
-        heartbeat: &mut tokio::time::Interval,
-    ) -> Result<(), DanmuStreamError> {
-        let send = tx.send(event);
-        tokio::pin!(send);
-        loop {
-            tokio::select! {
-                result = &mut send => {
-                    return result.map_err(|error| DanmuStreamError::WebsocketError {
-                        err: format!("Failed to send message to channel: {error}"),
-                    });
-                }
-                _ = heartbeat.tick() => {
-                    // Once graceful shutdown starts, keep waiting for recorder
-                    // capacity instead of failing this accepted event merely
-                    // because the websocket writer was closed by `stop`.
-                    if !*self.stop.read().await {
-                        self.send_ws_message(Self::heartbeat_message(), "heartbeat").await?;
+/// Read/control processing must remain independent of recorder backpressure.
+/// Only one frame is persisted at a time, preserving event and ACK order. On
+/// transport failure or overload, retain and drain every already-read frame.
+async fn pump_connection<S, F, Fut>(
+    mut read: S,
+    tx: mpsc::Sender<DanmuMessageType>,
+    room_id: &str,
+    stop: &RwLock<bool>,
+    mut send: F,
+) -> Result<(), DanmuStreamError>
+where
+    S: Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    F: FnMut(WsMessage) -> Fut,
+    Fut: Future<Output = Result<(), DanmuStreamError>>,
+{
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
+    let mut pending = VecDeque::<Vec<u8>>::new();
+    let mut pending_bytes = 0;
+    let mut active = None;
+    let mut connected = true;
+    let mut transport_error = None;
+    loop {
+        if *stop.read().await {
+            connected = false;
+        }
+        if active.is_none() {
+            if let Some(data) = pending.pop_front() {
+                pending_bytes -= data.len();
+                match decode_binary_message(&data, room_id) {
+                    Ok((ack, events)) => {
+                        active = Some(Box::pin(persist_frame(ack, events, &tx)));
                     }
+                    Err(error) => {
+                        connected = false;
+                        transport_error = Some(error);
+                        continue;
+                    }
+                }
+            } else if !connected {
+                return transport_error.map_or(Ok(()), Err);
+            }
+        }
+        tokio::select! {
+            result = async { active.as_mut().unwrap().await }, if active.is_some() => {
+                active = None;
+                // A storage failure is not safe to ACK. Queued frames remain
+                // unacknowledged and can be replayed by the server.
+                if let Some(ack) = result? {
+                    if connected && !*stop.read().await {
+                        if let Err(error) = send(WsMessage::binary(ack.encode_to_vec())).await {
+                            connected = false;
+                            transport_error = Some(error);
+                        }
+                    }
+                }
+            }
+            _ = heartbeat.tick(), if connected => {
+                if !*stop.read().await {
+                    if let Err(error) = send(DouyinDanmu::heartbeat_message()).await {
+                        connected = false;
+                        transport_error = Some(error);
+                    }
+                }
+            }
+            message = read.next(), if connected => {
+                match message {
+                    Some(Ok(WsMessage::Binary(data))) => {
+                        pending_bytes += data.len();
+                        pending.push_back(data.to_vec());
+                        if pending.len() >= MAX_PENDING_FRAMES || pending_bytes >= MAX_PENDING_FRAME_BYTES {
+                            // Retain even the frame which reaches the limit.
+                            // Stop reading before the queue can grow again;
+                            // reconnect only after accepted frames drain.
+                            connected = false;
+                            transport_error = Some(DanmuStreamError::WebsocketError {
+                                err: "Douyin frame queue reached capacity; draining before reconnect".to_string(),
+                            });
+                            let _ = send(WsMessage::Close(None)).await;
+                        }
+                    }
+                    Some(Ok(WsMessage::Close(_))) => {
+                        connected = false;
+                        // Flush the close handshake promptly even while the
+                        // accepted data frames are still being persisted.
+                        let _ = send(WsMessage::Close(None)).await;
+                    }
+                    None => {
+                        connected = false;
+                    }
+                    Some(Ok(WsMessage::Ping(data))) => {
+                        if let Err(error) = send(WsMessage::Pong(data)).await {
+                            connected = false;
+                            transport_error = Some(error);
+                        }
+                    }
+                    Some(Err(error)) => {
+                        connected = false;
+                        transport_error = Some(DanmuStreamError::WebsocketError {
+                            err: format!("Failed to read message: {error}"),
+                        });
+                    }
+                    _ => {}
                 }
             }
         }
     }
+}
 
-    async fn wait_for_persistence(
-        &self,
-        tx: &mpsc::Sender<DanmuMessageType>,
-        heartbeat: &mut tokio::time::Interval,
-    ) -> Result<(), DanmuStreamError> {
+async fn persist_frame(
+    ack: Option<PushFrame>,
+    events: Vec<DanmuMessageType>,
+    tx: &mpsc::Sender<DanmuMessageType>,
+) -> Result<Option<PushFrame>, DanmuStreamError> {
+    let has_events = !events.is_empty();
+    for event in events {
+        tx.send(event)
+            .await
+            .map_err(|error| DanmuStreamError::WebsocketError {
+                err: format!("Failed to send message to channel: {error}"),
+            })?;
+    }
+    if has_events {
         let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
-        self.forward_event(
-            tx,
-            DanmuMessageType::PersistBarrier(persisted_tx),
-            heartbeat,
-        )
-        .await?;
-        tokio::pin!(persisted_rx);
-        loop {
-            tokio::select! {
-                result = &mut persisted_rx => {
-                    return match result {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(error)) => Err(DanmuStreamError::WebsocketError {
-                            err: format!("Douyin event persistence failed before ACK: {error}"),
-                        }),
-                        Err(error) => Err(DanmuStreamError::WebsocketError {
-                            err: format!("Douyin persistence barrier was dropped before ACK: {error}"),
-                        }),
-                    };
-                }
-                _ = heartbeat.tick() => {
-                    if !*self.stop.read().await {
-                        self.send_ws_message(Self::heartbeat_message(), "heartbeat").await?;
-                    }
-                }
-            }
-        }
+        tx.send(DanmuMessageType::PersistBarrier(persisted_tx))
+            .await
+            .map_err(|error| DanmuStreamError::WebsocketError {
+                err: format!("Failed to send persistence barrier: {error}"),
+            })?;
+        match persisted_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(DanmuStreamError::WebsocketError {
+                err: format!("Douyin event persistence failed before ACK: {error}"),
+            }),
+            Err(error) => Err(DanmuStreamError::WebsocketError {
+                err: format!("Douyin persistence barrier was dropped before ACK: {error}"),
+            }),
+        }?;
     }
+    Ok(ack)
 }
 
 fn decode_binary_message(
@@ -627,6 +642,171 @@ mod tests {
             stop: Arc::new(RwLock::new(false)),
             write: Arc::new(RwLock::new(None)),
         }
+    }
+
+    fn chat_frame(id: u64, contents: &[&str]) -> WsMessage {
+        let response = Response {
+            messages_list: contents
+                .iter()
+                .map(|content| CommonMessage {
+                    method: "WebcastChatMessage".to_string(),
+                    payload: DouyinChatMessage {
+                        content: (*content).to_string(),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                    ..Default::default()
+                })
+                .collect(),
+            need_ack: true,
+            internal_ext: format!("cursor-{id}"),
+            ..Default::default()
+        };
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&response.encode_to_vec()).unwrap();
+        WsMessage::binary(
+            PushFrame {
+                log_id: id,
+                payload: encoder.finish().unwrap(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    type TestPump = (
+        mpsc::Sender<WsMessage>,
+        mpsc::Receiver<WsMessage>,
+        mpsc::Receiver<DanmuMessageType>,
+        tokio::task::JoinHandle<Result<(), DanmuStreamError>>,
+    );
+
+    fn test_pump() -> TestPump {
+        let (input_tx, input_rx) = mpsc::channel::<WsMessage>(MAX_PENDING_FRAMES + 4);
+        let (output_tx, output_rx) = mpsc::channel(16);
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            let read = Box::pin(futures_util::stream::unfold(input_rx, |mut rx| async {
+                rx.recv().await.map(|message| (Ok(message), rx))
+            }));
+            let stop = RwLock::new(false);
+            pump_connection(read, event_tx, "room", &stop, |message| {
+                let output_tx = output_tx.clone();
+                async move {
+                    output_tx.send(message).await.unwrap();
+                    Ok(())
+                }
+            })
+            .await
+        });
+        (input_tx, output_rx, event_rx, task)
+    }
+
+    async fn next_test_message<T>(rx: &mut mpsc::Receiver<T>) -> T {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("pump stalled")
+            .expect("channel closed")
+    }
+
+    async fn expect_chat(rx: &mut mpsc::Receiver<DanmuMessageType>, content: &str) {
+        let DanmuMessageType::Event(event) = next_test_message(rx).await else {
+            panic!("expected chat");
+        };
+        assert_eq!(event.data["content"], content);
+    }
+
+    async fn next_barrier(
+        rx: &mut mpsc::Receiver<DanmuMessageType>,
+    ) -> tokio::sync::oneshot::Sender<Result<(), String>> {
+        let DanmuMessageType::PersistBarrier(barrier) = next_test_message(rx).await else {
+            panic!("expected barrier");
+        };
+        barrier
+    }
+
+    async fn ping_pump(input: &mpsc::Sender<WsMessage>, output: &mut mpsc::Receiver<WsMessage>) {
+        input.send(WsMessage::Ping(vec![7].into())).await.unwrap();
+        assert_eq!(
+            next_test_message(output).await,
+            WsMessage::Pong(vec![7].into())
+        );
+    }
+
+    #[tokio::test]
+    async fn backpressure_keeps_ping_responsive_and_acks_only_persisted_frames_in_order() {
+        let (input, mut output, mut events, task) = test_pump();
+        // Capacity one blocks forwarding the second event, not socket reads.
+        input.send(chat_frame(1, &["one", "two"])).await.unwrap();
+        ping_pump(&input, &mut output).await;
+        input.send(chat_frame(2, &["three"])).await.unwrap();
+        ping_pump(&input, &mut output).await;
+        expect_chat(&mut events, "one").await;
+        expect_chat(&mut events, "two").await;
+        let barrier = next_barrier(&mut events).await;
+        // The persistence wait also must not block Ping/Pong or ACK early.
+        ping_pump(&input, &mut output).await;
+        assert!(output.try_recv().is_err());
+        assert!(events.try_recv().is_err());
+        barrier.send(Ok(())).unwrap();
+        let ack = next_test_message(&mut output).await.into_data();
+        assert_eq!(PushFrame::decode(ack).unwrap().log_id, 1);
+        expect_chat(&mut events, "three").await;
+        next_barrier(&mut events).await.send(Ok(())).unwrap();
+        let ack = next_test_message(&mut output).await.into_data();
+        assert_eq!(PushFrame::decode(ack).unwrap().log_id, 2);
+        input.send(WsMessage::Close(None)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_close_drains_accepted_frames_without_acknowledging_closed_connection() {
+        let (input, mut output, mut events, task) = test_pump();
+        input.send(chat_frame(1, &["one"])).await.unwrap();
+        expect_chat(&mut events, "one").await;
+        let barrier = next_barrier(&mut events).await;
+        input.send(chat_frame(2, &["two"])).await.unwrap();
+        input.send(WsMessage::Close(None)).await.unwrap();
+        assert_eq!(next_test_message(&mut output).await, WsMessage::Close(None));
+        barrier.send(Ok(())).unwrap();
+        expect_chat(&mut events, "two").await;
+        next_barrier(&mut events).await.send(Ok(())).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(output.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn full_frame_queue_closes_then_drains_every_accepted_frame() {
+        let (input, mut output, mut events, task) = test_pump();
+        input.send(chat_frame(0, &["first"])).await.unwrap();
+        expect_chat(&mut events, "first").await;
+        let barrier = next_barrier(&mut events).await;
+        for id in 1..=MAX_PENDING_FRAMES {
+            input
+                .send(chat_frame(id as u64, &[&id.to_string()]))
+                .await
+                .unwrap();
+        }
+        assert_eq!(next_test_message(&mut output).await, WsMessage::Close(None));
+        barrier.send(Ok(())).unwrap();
+        for id in 1..=MAX_PENDING_FRAMES {
+            expect_chat(&mut events, &id.to_string()).await;
+            next_barrier(&mut events).await.send(Ok(())).unwrap();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().to_string().contains("capacity"));
+        assert!(output.try_recv().is_err());
     }
 
     #[test]

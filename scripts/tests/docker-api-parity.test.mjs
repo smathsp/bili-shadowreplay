@@ -186,23 +186,29 @@ test("Douyin websocket sends heartbeat and ACK data over the real connection", (
   assert.doesNotMatch(douyinProviderSource, /webcast5-ws-web-hl\.douyin\.com/);
   assert.match(
     douyinProviderSource,
-    /self\.send_ws_message\(Self::heartbeat_message\(\), "heartbeat"\)/,
+    /send\(DouyinDanmu::heartbeat_message\(\)\)\.await/,
   );
+  assert.match(
+    douyinProviderSource,
+    /WsMessage::Ping\(data\)[\s\S]*?send\(WsMessage::Pong\(data\)\)\.await/,
+  );
+  assert.match(douyinProviderSource, /MAX_PENDING_FRAMES/);
+  assert.match(douyinProviderSource, /MAX_PENDING_FRAME_BYTES/);
   assert.match(
     douyinProviderSource,
     /payload:\s*response\.internal_ext\.as_bytes\(\)\.to_vec\(\)/,
   );
   assert.match(douyinProviderSource, /let \(ack, events\) = decode_binary_message/);
-  assert.ok(
-    douyinProviderSource.indexOf("for event in events") <
-      douyinProviderSource.indexOf('"ack"'),
-    "Douyin frames must enter the lossless queue before they are ACKed",
+  assert.match(
+    douyinProviderSource,
+    /for event in events[\s\S]*?DanmuMessageType::PersistBarrier/,
   );
   assert.match(
     douyinProviderSource,
-    /forward_event[\s\S]*?heartbeat\.tick\(\)[\s\S]*?send_ws_message/,
+    /result = async \{ active\.as_mut\(\)\.unwrap\(\)\.await \}[\s\S]*?if let Some\(ack\) = result\?[\s\S]*?send\(WsMessage::binary\(ack\.encode_to_vec\(\)\)\)/,
   );
-  assert.match(douyinProviderSource, /wait_for_persistence/);
+  assert.match(douyinProviderSource, /pump_connection/);
+  assert.match(douyinProviderSource, /persist_frame/);
   assert.match(douyinProviderSource, /DanmuMessageType::PersistBarrier/);
 });
 

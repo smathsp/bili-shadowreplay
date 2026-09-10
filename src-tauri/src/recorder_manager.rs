@@ -5,6 +5,7 @@ use crate::database::recorder::RecorderRow;
 use crate::database::video::VideoRow;
 use crate::database::{Database, DatabaseError};
 use crate::ffmpeg::{clip_timeline_anchors, encode_video_danmu, transcode, Range};
+use crate::migration::migration_methods::try_rebuild_archives;
 use crate::progress::progress_reporter::{EventEmitter, ProgressReporter, ProgressReporterTrait};
 use crate::subtitle_generator::item_to_srt;
 use crate::task::{Task, TaskManager, TaskPriority};
@@ -18,7 +19,9 @@ use recorder::danmu::{DanmuEntry, DanmuStorage};
 use recorder::errors::RecorderError;
 use recorder::events::RecorderEvent;
 use recorder::platforms::bilibili::BiliRecorder;
-use recorder::platforms::douyin::{acknowledge_live_end, DouyinRecorder};
+use recorder::platforms::douyin::{
+    acknowledge_live_end, DouyinRecorder, DOUYIN_SESSION_PARENT_FILE,
+};
 use recorder::platforms::huya::HuyaRecorder;
 use recorder::platforms::kuaishou::KuaishouRecorder;
 use recorder::platforms::tiktok::TikTokRecorder;
@@ -29,17 +32,18 @@ use recorder::UserInfo;
 use recorder::{CachePath, RecorderInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(feature = "gui")]
 use tauri_plugin_notification::NotificationExt;
 use thiserror::Error;
 use tokio::fs::{remove_file, write, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::broadcast;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, Mutex, RwLock};
 
 #[cfg(not(feature = "headless"))]
 use tauri::AppHandle;
@@ -83,6 +87,226 @@ pub struct RelatedPlaylist {
     pub live_id: String,
     pub title: String,
     pub path: PathBuf,
+}
+
+const DOUYIN_WHOLE_RETRY_INITIAL_SECS: u64 = 5;
+const DOUYIN_WHOLE_RETRY_MAX_SECS: u64 = 300;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DouyinWholeSessionKey {
+    room_id: String,
+    session_id: String,
+}
+
+fn claim_douyin_whole_session(
+    claimed: &mut HashSet<DouyinWholeSessionKey>,
+    room_id: &str,
+    session_id: &str,
+) -> bool {
+    claimed.insert(DouyinWholeSessionKey {
+        room_id: room_id.to_string(),
+        session_id: session_id.to_string(),
+    })
+}
+
+fn douyin_whole_retry_delay(failure_count: u32) -> Duration {
+    let exponent = failure_count.saturating_sub(1).min(6);
+    let seconds = DOUYIN_WHOLE_RETRY_INITIAL_SECS
+        .saturating_mul(1_u64 << exponent)
+        .min(DOUYIN_WHOLE_RETRY_MAX_SECS);
+    Duration::from_secs(seconds)
+}
+
+async fn retry_until_douyin_live_end_acknowledged<F, Fut, D>(
+    mut acknowledge: F,
+    mut retry_delay: D,
+) -> u32
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+    D: FnMut(u32) -> Duration,
+{
+    let mut failure_count = 0_u32;
+    loop {
+        if acknowledge().await {
+            return failure_count;
+        }
+        failure_count = failure_count.saturating_add(1);
+        tokio::time::sleep(retry_delay(failure_count)).await;
+    }
+}
+
+fn is_known_douyin_archive_sidecar(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    lower == DOUYIN_SESSION_PARENT_FILE
+        || lower == "events.jsonl"
+        || lower == "danmus.jsonl"
+        || lower == "danmus.json"
+        || lower == "cover.jpg"
+        || lower == "cover.jpeg"
+        || lower == "cover.png"
+        || lower == "cover.webp"
+        || lower.ends_with(".ass")
+        || lower.ends_with(".srt")
+        || lower.ends_with(".vtt")
+        || lower.ends_with(".tmp")
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum DouyinArchiveDiskState {
+    Empty,
+    ValuableDataOnly,
+    VideoMedia { total_size: u64 },
+}
+
+/// Return the total directory size when an archive contains durable media
+/// evidence. Unknown non-empty files are treated as media: retaining an empty
+/// directory is harmless, while deleting a segment with an unusual extension
+/// is irreversible.
+async fn inspect_douyin_archive(archive_path: &Path) -> std::io::Result<DouyinArchiveDiskState> {
+    let mut entries = match tokio::fs::read_dir(archive_path).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DouyinArchiveDiskState::Empty)
+        }
+        Err(error) => return Err(error),
+    };
+    let mut total_size = 0_u64;
+    let mut has_media = false;
+    let mut has_valuable_data = false;
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let metadata = entry.metadata().await?;
+        let size = metadata.len();
+        total_size = total_size.saturating_add(size);
+        if size == 0 {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let is_media = match file_name.to_str() {
+            Some("playlist.m3u8" | "entries.log") => true,
+            Some(file_name) => !is_known_douyin_archive_sidecar(file_name),
+            None => true,
+        };
+        has_media |= is_media;
+        has_valuable_data |= if is_media {
+            true
+        } else {
+            match file_name.to_str() {
+                Some(name) => {
+                    let lower = name.to_ascii_lowercase();
+                    lower != DOUYIN_SESSION_PARENT_FILE && !lower.ends_with(".tmp")
+                }
+                None => true,
+            }
+        };
+    }
+    if has_media {
+        Ok(DouyinArchiveDiskState::VideoMedia {
+            total_size: total_size.max(1),
+        })
+    } else if has_valuable_data {
+        Ok(DouyinArchiveDiskState::ValuableDataOnly)
+    } else {
+        Ok(DouyinArchiveDiskState::Empty)
+    }
+}
+
+async fn douyin_archive_media_size(archive_path: &Path) -> std::io::Result<Option<u64>> {
+    Ok(match inspect_douyin_archive(archive_path).await? {
+        DouyinArchiveDiskState::VideoMedia { total_size } => Some(total_size),
+        DouyinArchiveDiskState::Empty | DouyinArchiveDiskState::ValuableDataOnly => None,
+    })
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum DouyinZeroSizedArchiveRepair {
+    Empty,
+    ValuableDataOnly,
+    VideoRepaired,
+}
+
+async fn repair_douyin_zero_sized_archive(
+    db: &Database,
+    cache_dir: &Path,
+    room_id: &str,
+    live_id: &str,
+) -> Result<DouyinZeroSizedArchiveRepair, RecorderManagerError> {
+    let archive_path = cache_dir
+        .join(PlatformType::Douyin.as_str())
+        .join(room_id)
+        .join(live_id);
+    match inspect_douyin_archive(&archive_path).await? {
+        DouyinArchiveDiskState::Empty => Ok(DouyinZeroSizedArchiveRepair::Empty),
+        DouyinArchiveDiskState::ValuableDataOnly => {
+            Ok(DouyinZeroSizedArchiveRepair::ValuableDataOnly)
+        }
+        DouyinArchiveDiskState::VideoMedia { total_size } => {
+            db.update_record_delta(live_id, 0.0, total_size).await?;
+            Ok(DouyinZeroSizedArchiveRepair::VideoRepaired)
+        }
+    }
+}
+
+async fn douyin_session_has_cached_media(
+    db: &Database,
+    cache_dir: &Path,
+    room_id: &str,
+    session_id: &str,
+) -> Result<bool, RecorderManagerError> {
+    let room_path = cache_dir.join(PlatformType::Douyin.as_str()).join(room_id);
+    let related_archives = db
+        .get_archives_by_parent_id(room_id, session_id)
+        .await?
+        .into_iter()
+        .filter(|archive| archive.platform == PlatformType::Douyin.as_str())
+        .map(|archive| archive.live_id)
+        .collect::<HashSet<_>>();
+
+    for live_id in &related_archives {
+        if douyin_archive_media_size(&room_path.join(live_id))
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+
+    let mut entries = match tokio::fs::read_dir(&room_path).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let Some(live_id) = entry.file_name().to_str().map(str::to_string) else {
+            // An uninspectable archive name is uncertainty. Keep the recovery
+            // marker instead of declaring this session empty.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Douyin archive directory has a non-Unicode name",
+            )
+            .into());
+        };
+        if live_id.starts_with('.') || related_archives.contains(&live_id) {
+            continue;
+        }
+        let parent_path = entry.path().join(DOUYIN_SESSION_PARENT_FILE);
+        let belongs_to_session = match tokio::fs::read_to_string(&parent_path).await {
+            Ok(parent_id) => parent_id.trim() == session_id,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if belongs_to_session && douyin_archive_media_size(&entry.path()).await?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn require_danmu_ass_files(
@@ -186,6 +410,13 @@ pub struct RecorderManager {
     event_tx: broadcast::Sender<RecorderEvent>,
     is_migrating: Arc<AtomicBool>,
     webhook_poster: WebhookPoster,
+    /// Claimed sessions are retained for the process lifetime. This prevents a
+    /// delayed duplicate recovery event from creating a second export even
+    /// after the first long-running task has completed.
+    douyin_whole_sessions: Arc<Mutex<HashSet<DouyinWholeSessionKey>>>,
+    /// `try_rebuild_archives` updates zero-sized rows by adding their measured
+    /// size, so concurrent reconciliations must not both apply the same delta.
+    douyin_archive_reconcile: Arc<Mutex<()>>,
 }
 
 #[derive(Error, Debug)]
@@ -275,6 +506,8 @@ impl RecorderManager {
             event_tx,
             is_migrating: Arc::new(AtomicBool::new(false)),
             webhook_poster,
+            douyin_whole_sessions: Arc::new(Mutex::new(HashSet::new())),
+            douyin_archive_reconcile: Arc::new(Mutex::new(())),
         };
 
         // Start event listener
@@ -418,24 +651,69 @@ impl RecorderManager {
                     if record.size == 0 {
                         let platform = PlatformType::from_str(&recorder.room_info.platform)
                             .unwrap_or(PlatformType::BiliBili);
-                        if platform == PlatformType::Douyin && recorder.room_info.status {
-                            // The session-level danmu task can still be writing
-                            // into this attempt between HLS reconnects. Removing
-                            // the directory on Linux would unlink its open JSONL
-                            // file and permanently lose those events.
-                            log::info!(
-                                "Preserving empty active Douyin attempt for lossless danmu recovery: {live_id}"
+                        let cache_dir = PathBuf::from(&self.config.read().await.cache);
+                        if platform == PlatformType::Douyin {
+                            match repair_douyin_zero_sized_archive(
+                                &self.db, &cache_dir, &room_id, &live_id,
+                            )
+                            .await
+                            {
+                                Ok(DouyinZeroSizedArchiveRepair::VideoRepaired) => {
+                                    log::warn!(
+                                        "Repaired zero-sized Douyin archive from durable cache media: {live_id}"
+                                    );
+                                    continue;
+                                }
+                                Ok(DouyinZeroSizedArchiveRepair::ValuableDataOnly) => {
+                                    log::info!(
+                                        "Preserving data-only Douyin archive without treating it as video: {live_id}"
+                                    );
+                                    continue;
+                                }
+                                Err(error) => {
+                                    // An unreadable directory or failed DB repair
+                                    // is uncertainty, not proof that the archive is
+                                    // empty. Never trade a transient error for data
+                                    // loss.
+                                    log::error!(
+                                        "Could not verify zero-sized Douyin archive {live_id}; preserving it: {error}"
+                                    );
+                                    continue;
+                                }
+                                Ok(DouyinZeroSizedArchiveRepair::Empty)
+                                    if recorder.room_info.status =>
+                                {
+                                    // The session-level danmu task can still be
+                                    // writing into this attempt between HLS
+                                    // reconnects. Removing the directory on Linux
+                                    // would unlink its open JSONL file.
+                                    log::info!(
+                                        "Preserving empty active Douyin attempt for lossless danmu recovery: {live_id}"
+                                    );
+                                    continue;
+                                }
+                                Ok(DouyinZeroSizedArchiveRepair::Empty) => {}
+                            }
+                        }
+
+                        if let Err(error) = self.db.remove_record(&live_id).await {
+                            log::error!(
+                                "Failed to remove empty archive row {live_id}; preserving its cache directory: {error}"
                             );
                             continue;
                         }
-                        let _ = self.db.remove_record(&live_id).await;
                         // remove record folder
-                        let cache_folder = Path::new(self.config.read().await.cache.as_str())
+                        let cache_folder = cache_dir
                             .join(platform.as_str())
-                            .join(room_id)
-                            .join(live_id);
-                        let _ = tokio::fs::remove_dir_all(&cache_folder).await;
-                        log::info!("Record folder removed: {cache_folder:?}");
+                            .join(&room_id)
+                            .join(&live_id);
+                        match tokio::fs::remove_dir_all(&cache_folder).await {
+                            Ok(()) => log::info!("Record folder removed: {cache_folder:?}"),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => log::warn!(
+                                "Failed to remove empty record folder {cache_folder:?}: {error}"
+                            ),
+                        }
                     }
                 }
                 RecorderEvent::ProgressUpdate { id, content } => {
@@ -477,6 +755,37 @@ impl RecorderManager {
                 .await;
             return;
         }
+
+        if platform == PlatformType::Douyin {
+            let session_id = recorder.platform_live_id.trim();
+            if session_id.is_empty() {
+                // There is no stable key for either deduplication or recovery.
+                // Do not consume any marker and do not guess from another live.
+                log::error!("Ignoring Douyin LiveEnd without a session id for room {room_id}");
+                return;
+            }
+            let claimed = {
+                let mut sessions = self.douyin_whole_sessions.lock().await;
+                claim_douyin_whole_session(&mut sessions, room_id, session_id)
+            };
+            if !claimed {
+                log::info!(
+                    "Douyin whole-session task already claimed: room={room_id}, session={session_id}"
+                );
+                return;
+            }
+
+            let manager = self.clone();
+            let room_id = room_id.to_string();
+            let recorder = recorder.clone();
+            tokio::spawn(async move {
+                manager
+                    .run_douyin_whole_session_with_retry(room_id, recorder)
+                    .await;
+            });
+            return;
+        }
+
         let encode_danmu = auto_generate.encode_danmu;
 
         let recorder_id = format!("{}:{}", platform.as_str(), room_id);
@@ -503,7 +812,7 @@ impl RecorderManager {
                 &serde_json::json!({
                     "platform": platform.as_str(),
                     "room_id": room_id,
-                    "parent_id": parent_id,
+                    "parent_id": parent_id.clone(),
                     "encode_danmu": encode_danmu,
                 })
                 .to_string(),
@@ -598,7 +907,250 @@ impl RecorderManager {
                 .db
                 .update_task(&enqueue_failure_task_id, "failed", &message, None)
                 .await;
-            return;
+        }
+    }
+
+    async fn resolve_douyin_live_end_parent(
+        &self,
+        room_id: &str,
+        recorder: &RecorderInfo,
+    ) -> Result<Option<String>, String> {
+        match live_end_parent_id(&self.db, PlatformType::Douyin, room_id, recorder).await {
+            Ok(Some(parent_id)) => return Ok(Some(parent_id)),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to query ended Douyin archives for room {room_id}: {error}"
+                ));
+            }
+        }
+
+        if self.is_migrating.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("cache migration is still in progress".to_string());
+        }
+
+        let cache_dir = PathBuf::from(&self.config.read().await.cache);
+        let _reconcile_guard = self.douyin_archive_reconcile.lock().await;
+
+        // A different ended session may have repaired the same room while this
+        // one waited for the reconciliation lock.
+        match live_end_parent_id(&self.db, PlatformType::Douyin, room_id, recorder).await {
+            Ok(Some(parent_id)) => return Ok(Some(parent_id)),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to re-query ended Douyin archives for room {room_id}: {error}"
+                ));
+            }
+        }
+
+        try_rebuild_archives(&self.db, cache_dir.clone())
+            .await
+            .map_err(|error| {
+                format!("failed to reconcile Douyin archive cache for room {room_id}: {error}")
+            })?;
+
+        match live_end_parent_id(&self.db, PlatformType::Douyin, room_id, recorder).await {
+            Ok(Some(parent_id)) => return Ok(Some(parent_id)),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to query reconciled Douyin archives for room {room_id}: {error}"
+                ));
+            }
+        }
+
+        let session_id = recorder.platform_live_id.trim();
+        if douyin_session_has_cached_media(&self.db, &cache_dir, room_id, session_id)
+            .await
+            .map_err(|error| {
+                format!("failed to inspect Douyin cache for room {room_id}: {error}")
+            })?
+        {
+            return Err(format!(
+                "Douyin cache still contains media for session {session_id}, but no usable database archive was reconciled"
+            ));
+        }
+
+        Ok(None)
+    }
+
+    async fn enqueue_douyin_whole_clip_attempt(
+        &self,
+        room_id: &str,
+        parent_id: String,
+        encode_danmu: bool,
+    ) -> Result<(), String> {
+        let task = self
+            .db
+            .generate_task(
+                "generate_whole_clip",
+                "",
+                &serde_json::json!({
+                    "platform": PlatformType::Douyin.as_str(),
+                    "room_id": room_id,
+                    "parent_id": parent_id.clone(),
+                    "encode_danmu": encode_danmu,
+                })
+                .to_string(),
+            )
+            .await
+            .map_err(|error| format!("failed to create whole-session task: {error}"))?;
+
+        let reporter = match ProgressReporter::new(self.db.clone(), &self.emitter, &task.id).await {
+            Ok(reporter) => reporter,
+            Err(error) => {
+                let message = format!("Failed to create reporter: {error}");
+                let _ = self
+                    .db
+                    .update_task(&task.id, "failed", &message, None)
+                    .await;
+                return Err(message);
+            }
+        };
+        log::info!(
+            "Create retryable Douyin task: {} {}",
+            task.id,
+            task.task_type
+        );
+
+        let manager = self.clone();
+        let task_id = task.id.clone();
+        let task_id_for_run = task_id.clone();
+        let room_id = room_id.to_string();
+        let reporter_for_run = reporter.clone();
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let task_future = async move {
+            let result = match manager
+                .generate_whole_clip(
+                    Some(&reporter_for_run),
+                    GenerateWholeClipParams {
+                        encode_danmu,
+                        platform: PlatformType::Douyin.as_str().to_string(),
+                        room_id,
+                        parent_id,
+                        selected_live_ids: None,
+                        output_name: None,
+                    },
+                )
+                .await
+            {
+                Ok(()) => {
+                    reporter_for_run
+                        .finish(true, "Whole clip generated successfully")
+                        .await;
+                    let _ = manager
+                        .db
+                        .update_task(
+                            &task_id_for_run,
+                            "success",
+                            "Whole clip generated successfully",
+                            None,
+                        )
+                        .await;
+                    Ok(())
+                }
+                Err(error) => {
+                    let message = format!("Failed to generate whole clip: {error}");
+                    log::error!("{message}");
+                    reporter_for_run.finish(false, &message).await;
+                    let _ = manager
+                        .db
+                        .update_task(&task_id_for_run, "failed", &message, None)
+                        .await;
+                    Err(message)
+                }
+            };
+            let _ = completion_tx.send(result.clone());
+            result
+        };
+
+        if let Err(error) = self
+            .task_manager
+            .add_task(Task::new(
+                task_id.clone(),
+                TaskPriority::Normal,
+                task_future,
+            ))
+            .await
+        {
+            let message = format!("Failed to enqueue whole clip task: {error}");
+            log::error!("{message}");
+            reporter.finish(false, &message).await;
+            let _ = self
+                .db
+                .update_task(&task_id, "failed", &message, None)
+                .await;
+            return Err(message);
+        }
+
+        completion_rx
+            .await
+            .map_err(|_| "whole-session task ended without reporting a result".to_string())?
+    }
+
+    async fn run_douyin_whole_session_with_retry(&self, room_id: String, recorder: RecorderInfo) {
+        let session_id = recorder.platform_live_id.clone();
+        let mut failure_count = 0_u32;
+        loop {
+            if self.is_migrating.load(std::sync::atomic::Ordering::Relaxed) {
+                failure_count = failure_count.saturating_add(1);
+                let delay = douyin_whole_retry_delay(failure_count);
+                log::info!(
+                    "Deferring Douyin whole-session task during cache migration: room={room_id}, session={session_id}, retry_in={delay:?}"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let auto_generate = self.config.read().await.auto_generate.clone();
+            if !auto_generate.enabled {
+                self.acknowledge_douyin_live_end_with_retry(&room_id, &session_id)
+                    .await;
+                return;
+            }
+
+            let attempt = match self
+                .resolve_douyin_live_end_parent(&room_id, &recorder)
+                .await
+            {
+                Ok(Some(parent_id)) => {
+                    self.enqueue_douyin_whole_clip_attempt(
+                        &room_id,
+                        parent_id,
+                        auto_generate.encode_danmu,
+                    )
+                    .await
+                }
+                Ok(None) => {
+                    log::info!(
+                        "No durable media found for ended Douyin session: room={room_id}, session={session_id}"
+                    );
+                    self.acknowledge_douyin_live_end_with_retry(&room_id, &session_id)
+                        .await;
+                    return;
+                }
+                Err(error) => Err(error),
+            };
+
+            match attempt {
+                Ok(()) => {
+                    // The session remains claimed for the lifetime of this
+                    // process, so a delayed duplicate recovery broadcast cannot
+                    // enqueue another long-running export after completion.
+                    self.acknowledge_douyin_live_end_with_retry(&room_id, &session_id)
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    failure_count = failure_count.saturating_add(1);
+                    let delay = douyin_whole_retry_delay(failure_count);
+                    log::error!(
+                        "Douyin whole-session attempt failed: room={room_id}, session={session_id}, error={error}; retrying in {delay:?}"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
         }
     }
 
@@ -607,16 +1159,32 @@ impl RecorderManager {
         platform: PlatformType,
         room_id: &str,
         session_id: &str,
-    ) {
+    ) -> bool {
         if platform != PlatformType::Douyin {
-            return;
+            return true;
         }
         let cache_dir = PathBuf::from(&self.config.read().await.cache);
-        if !acknowledge_live_end(&cache_dir, room_id, session_id).await {
+        let acknowledged = acknowledge_live_end(&cache_dir, room_id, session_id).await;
+        if !acknowledged {
             log::warn!(
                 "Douyin whole-session completion did not clear the matching recovery marker"
             );
         }
+        acknowledged
+    }
+
+    async fn acknowledge_douyin_live_end_with_retry(&self, room_id: &str, session_id: &str) {
+        retry_until_douyin_live_end_acknowledged(
+            || self.acknowledge_douyin_live_end(PlatformType::Douyin, room_id, session_id),
+            |failure_count| {
+                let delay = douyin_whole_retry_delay(failure_count);
+                log::warn!(
+                    "Retrying Douyin whole-session marker acknowledgement: room={room_id}, session={session_id}, retry_in={delay:?}"
+                );
+                delay
+            },
+        )
+        .await;
     }
 
     pub fn set_migrating(&self, migrating: bool) {
@@ -1964,6 +2532,7 @@ impl RecorderManager {
 #[cfg(test)]
 mod live_end_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn database() -> Database {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -2002,6 +2571,157 @@ mod live_end_tests {
             .await
             .unwrap();
         db.update_record_delta(live, 4.0, 1024).await.unwrap();
+    }
+
+    fn temp_cache_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bili-shadowreplay-manager-test-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[test]
+    fn whole_session_claim_is_scoped_to_room_and_session() {
+        let mut claimed = HashSet::new();
+
+        assert!(claim_douyin_whole_session(
+            &mut claimed,
+            "room-1",
+            "session-1"
+        ));
+        assert!(!claim_douyin_whole_session(
+            &mut claimed,
+            "room-1",
+            "session-1"
+        ));
+        assert!(claim_douyin_whole_session(
+            &mut claimed,
+            "room-1",
+            "session-2"
+        ));
+        assert!(claim_douyin_whole_session(
+            &mut claimed,
+            "room-2",
+            "session-1"
+        ));
+    }
+
+    #[test]
+    fn whole_session_retry_delay_backs_off_and_caps() {
+        let delays = (1..=9)
+            .map(|failure_count| douyin_whole_retry_delay(failure_count).as_secs())
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays, vec![5, 10, 20, 40, 80, 160, 300, 300, 300]);
+    }
+
+    #[tokio::test]
+    async fn live_end_acknowledgement_retries_without_repeating_completed_work() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_ack = attempts.clone();
+
+        let failed_attempts = retry_until_douyin_live_end_acknowledged(
+            move || {
+                let attempts = attempts_for_ack.clone();
+                async move { attempts.fetch_add(1, Ordering::SeqCst) >= 2 }
+            },
+            |_| Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(failed_attempts, 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn zero_sized_douyin_playlist_is_repaired_without_deletion() {
+        let db = database().await;
+        let cache_dir = temp_cache_dir();
+        let archive_dir = cache_dir
+            .join(PlatformType::Douyin.as_str())
+            .join("10220184")
+            .join("segment-1");
+        db.add_record(
+            PlatformType::Douyin,
+            "session-1",
+            "segment-1",
+            "10220184",
+            "test",
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(&archive_dir).await.unwrap();
+        tokio::fs::write(
+            archive_dir.join("playlist.m3u8"),
+            b"#EXTM3U\n#EXTINF:1,\nsegment-1.ts\n",
+        )
+        .await
+        .unwrap();
+
+        let repair = repair_douyin_zero_sized_archive(&db, &cache_dir, "10220184", "segment-1")
+            .await
+            .unwrap();
+
+        assert_eq!(repair, DouyinZeroSizedArchiveRepair::VideoRepaired);
+        assert!(db.get_record("10220184", "segment-1").await.unwrap().size > 0);
+        assert!(archive_dir.join("playlist.m3u8").exists());
+        assert!(
+            douyin_session_has_cached_media(&db, &cache_dir, "10220184", "session-1")
+                .await
+                .unwrap()
+        );
+
+        let _ = tokio::fs::remove_dir_all(cache_dir).await;
+    }
+
+    #[tokio::test]
+    async fn events_only_douyin_archive_is_preserved_without_fake_video_size() {
+        let db = database().await;
+        let cache_dir = temp_cache_dir();
+        let archive_dir = cache_dir
+            .join(PlatformType::Douyin.as_str())
+            .join("10220184")
+            .join("segment-1");
+        db.add_record(
+            PlatformType::Douyin,
+            "session-1",
+            "segment-1",
+            "10220184",
+            "test",
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(&archive_dir).await.unwrap();
+        tokio::fs::write(archive_dir.join(DOUYIN_SESSION_PARENT_FILE), b"session-1\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            archive_dir.join("events.jsonl"),
+            br#"{"method":"WebcastChatMessage","content":"kept"}\n"#,
+        )
+        .await
+        .unwrap();
+
+        let repair = repair_douyin_zero_sized_archive(&db, &cache_dir, "10220184", "segment-1")
+            .await
+            .unwrap();
+
+        assert_eq!(repair, DouyinZeroSizedArchiveRepair::ValuableDataOnly);
+        assert_eq!(
+            db.get_record("10220184", "segment-1").await.unwrap().size,
+            0
+        );
+        assert!(archive_dir.join("events.jsonl").exists());
+        assert_eq!(douyin_archive_media_size(&archive_dir).await.unwrap(), None);
+        assert!(
+            !douyin_session_has_cached_media(&db, &cache_dir, "10220184", "session-1")
+                .await
+                .unwrap()
+        );
+
+        let _ = tokio::fs::remove_dir_all(cache_dir).await;
     }
 
     #[tokio::test]

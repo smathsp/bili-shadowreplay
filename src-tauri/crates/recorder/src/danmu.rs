@@ -22,7 +22,26 @@ pub struct DanmuEntry {
 
 pub struct DanmuStorage {
     file_path: PathBuf,
-    file: RwLock<File>,
+    writer: RwLock<DanmuWriter>,
+}
+
+struct DanmuWriter {
+    file: File,
+    /// The last byte offset known to contain only complete records. This is set
+    /// when a partial append cannot be rolled back immediately. No later write
+    /// or ACK barrier may proceed until the file is truncated to this offset.
+    poisoned_at: Option<u64>,
+}
+
+impl DanmuWriter {
+    async fn recover_if_poisoned(&mut self) -> io::Result<()> {
+        let Some(reliable_len) = self.poisoned_at else {
+            return Ok(());
+        };
+        self.file.set_len(reliable_len).await?;
+        self.poisoned_at = None;
+        Ok(())
+    }
 }
 
 async fn repair_unterminated_tail(file_path: &PathBuf, writer: &mut File) -> io::Result<()> {
@@ -111,7 +130,10 @@ impl DanmuStorage {
         }
         Some(DanmuStorage {
             file_path: file_path.clone(),
-            file: RwLock::new(file),
+            writer: RwLock::new(DanmuWriter {
+                file,
+                poisoned_at: None,
+            }),
         })
     }
 
@@ -123,13 +145,15 @@ impl DanmuStorage {
             ));
         };
         line.push('\n');
-        let mut file = self.file.write().await;
-        let original_len = file.metadata().await?.len();
-        if let Err(write_error) = file.write_all(line.as_bytes()).await {
+        let mut writer = self.writer.write().await;
+        writer.recover_if_poisoned().await?;
+        let original_len = writer.file.metadata().await?.len();
+        if let Err(write_error) = writer.file.write_all(line.as_bytes()).await {
             // write_all may have appended a prefix before returning an error.
             // Roll it back so a retry cannot turn two fragments into one
             // newline-terminated but permanently invalid JSONL record.
-            if let Err(rollback_error) = file.set_len(original_len).await {
+            if let Err(rollback_error) = writer.file.set_len(original_len).await {
+                writer.poisoned_at = Some(original_len);
                 return Err(io::Error::new(
                     write_error.kind(),
                     format!(
@@ -157,23 +181,26 @@ impl DanmuStorage {
     /// Finish Tokio's outstanding file operation. Providers use this as a
     /// lightweight per-frame persistence barrier before acknowledging data.
     pub async fn flush(&self) -> Result<(), std::io::Error> {
-        let mut file = self.file.write().await;
-        file.flush().await
+        let mut writer = self.writer.write().await;
+        writer.recover_if_poisoned().await?;
+        writer.file.flush().await
     }
 
     /// Flush and sync the final tail at LiveEnd/SIGTERM. Keeping `sync_data`
     /// out of the per-frame ACK path avoids pathological Docker bind-mount I/O.
     pub async fn sync(&self) -> Result<(), std::io::Error> {
-        let mut file = self.file.write().await;
-        file.flush().await?;
-        file.sync_data().await
+        let mut writer = self.writer.write().await;
+        writer.recover_if_poisoned().await?;
+        writer.file.flush().await?;
+        writer.file.sync_data().await
     }
 
     /// Repair a write which was cancelled while the blocking file operation was
     /// in flight. Normal write errors are rolled back directly by `add_event`.
     pub async fn repair_tail(&self) -> Result<(), std::io::Error> {
-        let mut file = self.file.write().await;
-        repair_unterminated_tail(&self.file_path, &mut file).await
+        let mut writer = self.writer.write().await;
+        writer.recover_if_poisoned().await?;
+        repair_unterminated_tail(&self.file_path, &mut writer.file).await
     }
 
     /// Return the complete persisted events without discarding provider data.
@@ -379,6 +406,44 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(tokio::fs::read(&path).await.unwrap(), bytes);
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn poisoned_writer_truncates_to_reliable_offset_before_retrying() {
+        let path = std::env::temp_dir().join(format!(
+            "bili-shadowreplay-poisoned-danmu-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let complete = b"1234:complete\n";
+        tokio::fs::write(&path, complete).await.unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).await.unwrap();
+        file.write_all(b"{\"ts\":").await.unwrap();
+        file.flush().await.unwrap();
+
+        // Model the state left when write_all appended a prefix and the
+        // immediate set_len rollback also failed. The next operation must use
+        // the saved reliable boundary rather than append after that prefix.
+        let storage = DanmuStorage {
+            file_path: path.clone(),
+            writer: RwLock::new(DanmuWriter {
+                file,
+                poisoned_at: Some(complete.len() as u64),
+            }),
+        };
+        storage.add_line(5678, "after recovery").await.unwrap();
+        storage.flush().await.unwrap();
+
+        let events = storage.get_events().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data["content"], "complete");
+        assert_eq!(events[1].data["content"], "after recovery");
+        assert!(!tokio::fs::read_to_string(&path)
+            .await
+            .unwrap()
+            .contains("{\"ts\":{\"ts\":"));
+
+        drop(storage);
         let _ = tokio::fs::remove_file(path).await;
     }
 }
