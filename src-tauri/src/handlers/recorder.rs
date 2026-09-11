@@ -404,6 +404,75 @@ fn full_danmu_export_entry(event: &LiveEvent) -> Value {
     })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DouyinDanmuExportEntry<'a> {
+    display_id: &'a str,
+    name: &'a str,
+    avatar: &'a str,
+    content: &'a str,
+}
+
+fn object_string<'a>(object: Option<&'a Value>, key: &str) -> Option<&'a str> {
+    object
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn compact_douyin_danmu_export_entry(event: &LiveEvent) -> DouyinDanmuExportEntry<'_> {
+    let raw_user = event.raw.get("user");
+    let data_user = event.data.get("user");
+
+    let display_id = object_string(raw_user, "displayId")
+        .or_else(|| object_string(raw_user, "display_id"))
+        .or_else(|| object_string(data_user, "displayId"))
+        .or_else(|| object_string(data_user, "display_id"))
+        .unwrap_or_default();
+    let name = object_string(raw_user, "name")
+        .or_else(|| object_string(raw_user, "nickName"))
+        .or_else(|| object_string(raw_user, "nick_name"))
+        .or_else(|| object_string(data_user, "name"))
+        .or_else(|| object_string(data_user, "nickName"))
+        .or_else(|| object_string(data_user, "nick_name"))
+        .or_else(|| event.data.get("user_name").and_then(Value::as_str))
+        .unwrap_or_default();
+    let avatar = object_string(raw_user, "avatar")
+        .or_else(|| object_string(raw_user, "avatarUrl"))
+        .or_else(|| object_string(raw_user, "avatar_url"))
+        .or_else(|| object_string(data_user, "avatar"))
+        .or_else(|| object_string(data_user, "avatarUrl"))
+        .or_else(|| object_string(data_user, "avatar_url"))
+        .or_else(|| event.data.get("user_avatar").and_then(Value::as_str))
+        .unwrap_or_default();
+    let content = object_string(Some(&event.raw), "content")
+        .or_else(|| object_string(Some(&event.data), "content"))
+        .unwrap_or_default();
+
+    DouyinDanmuExportEntry {
+        display_id,
+        name,
+        avatar,
+        content,
+    }
+}
+
+fn export_compact_douyin_danmu_event(event: &LiveEvent) -> Result<Option<String>, String> {
+    if event.event_type != "danmu" {
+        return Ok(None);
+    }
+    if object_string(Some(&event.raw), "method")
+        .or_else(|| object_string(Some(&event.data), "method"))
+        .is_some_and(|method| method != "WebcastChatMessage")
+    {
+        return Ok(None);
+    }
+
+    serde_json::to_string(&compact_douyin_danmu_export_entry(event))
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 pub(crate) fn export_full_danmu_event(event: &LiveEvent) -> Result<Option<String>, String> {
     if event.event_type != "danmu" {
         return Ok(None);
@@ -414,10 +483,11 @@ pub(crate) fn export_full_danmu_event(event: &LiveEvent) -> Result<Option<String
         .map_err(|e| e.to_string())
 }
 
-/// Convert one persisted danmu record into the flattened JSONL format used by
-/// downloads. New recordings contain a serialized `LiveEvent`; the fallback
-/// keeps old `timestamp:content` recordings downloadable without pretending
-/// that metadata which was never recorded can be reconstructed.
+/// Convert one persisted danmu record into the JSONL format used by downloads.
+/// Douyin's Docker download is intentionally projected to the four requested
+/// fields while the richer on-disk event remains available for recovery and
+/// future migrations. The legacy fallback keeps old `timestamp:content`
+/// recordings downloadable without inventing metadata that was never stored.
 pub(crate) fn export_persisted_danmu_line(
     line: &str,
     platform: &str,
@@ -447,7 +517,11 @@ pub(crate) fn export_persisted_danmu_line(
         }
     };
 
-    export_full_danmu_event(&event)
+    if platform.eq_ignore_ascii_case("douyin") {
+        export_compact_douyin_danmu_event(&event)
+    } else {
+        export_full_danmu_event(&event)
+    }
 }
 
 fn export_full_danmu_jsonl(events: &[LiveEvent]) -> Result<String, String> {
@@ -478,7 +552,7 @@ pub async fn export_danmu(
             // records, so Docker clients must use the line-by-line download
             // endpoint instead of risking a container-wide OOM here.
             return Err(
-                "Docker 完整弹幕请使用流式 GET /api/export_danmu_file，POST /api/export_danmu 不支持 full=true"
+                "Docker 弹幕资料请使用流式 GET /api/export_danmu_file，POST /api/export_danmu 不支持 full=true"
                     .to_string(),
             );
         }
@@ -599,7 +673,7 @@ mod export_danmu_tests {
     }
 
     #[test]
-    fn persisted_line_export_flattens_raw_douyin_event_without_losing_fields() {
+    fn persisted_douyin_export_contains_exactly_the_four_requested_fields() {
         let event = LiveEvent {
             ts: 1_788_868_414_771,
             platform: "douyin".to_string(),
@@ -631,22 +705,123 @@ mod export_danmu_tests {
             .unwrap();
         let exported: Value = serde_json::from_str(&output).unwrap();
 
-        assert_eq!(exported, event.raw);
-        assert!(exported.get("raw").is_none());
-        assert!(exported.get("data").is_none());
+        assert_eq!(
+            exported,
+            json!({
+                "displayId": "dyr8cty6m73n",
+                "name": "枯枝邀明月",
+                "avatar": "https://example.com/avatar.jpeg",
+                "content": "终于能播了"
+            })
+        );
+        assert_eq!(exported.as_object().unwrap().len(), 4);
     }
 
     #[test]
-    fn persisted_line_export_supports_legacy_timestamp_content() {
+    fn persisted_douyin_export_uses_data_fallback_and_preserves_escaped_content() {
+        let event = LiveEvent {
+            ts: 1,
+            platform: "douyin".to_string(),
+            room_id: "123".to_string(),
+            event_type: "danmu".to_string(),
+            data: json!({
+                "method": "WebcastChatMessage",
+                "user": {
+                    "displayId": "bgz_1",
+                    "name": "114514研究所—白教授",
+                    "avatar": "https://example.com/avatar.jpeg?from=3067671334&size=100"
+                },
+                "content": "张导 可以让做后台用vue做web \"这样界面会流畅很多\"\n[看]"
+            }),
+            raw: json!({
+                "method": "",
+                "user": {
+                    "displayId": "",
+                    "name": "",
+                    "avatar": ""
+                },
+                "content": ""
+            }),
+        };
+        let persisted = serde_json::to_string(&event).unwrap();
+
+        let output = export_persisted_danmu_line(&persisted, "douyin", "123")
+            .unwrap()
+            .unwrap();
+        let exported: Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(exported["displayId"], "bgz_1");
+        assert_eq!(exported["name"], "114514研究所—白教授");
+        assert_eq!(
+            exported["avatar"],
+            "https://example.com/avatar.jpeg?from=3067671334&size=100"
+        );
+        assert_eq!(
+            exported["content"],
+            "张导 可以让做后台用vue做web \"这样界面会流畅很多\"\n[看]"
+        );
+        assert_eq!(exported.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn persisted_douyin_export_supports_legacy_timestamp_content() {
         let output = export_persisted_danmu_line("1234:包含:冒号", "douyin", "5678")
             .unwrap()
             .unwrap();
         let exported: Value = serde_json::from_str(&output).unwrap();
 
-        assert_eq!(exported["time"], 1234);
-        assert_eq!(exported["platform"], "douyin");
-        assert_eq!(exported["roomId"], "5678");
-        assert_eq!(exported["content"], "包含:冒号");
+        assert_eq!(
+            exported,
+            json!({
+                "displayId": "",
+                "name": "",
+                "avatar": "",
+                "content": "包含:冒号"
+            })
+        );
+    }
+
+    #[test]
+    fn persisted_douyin_export_rejects_explicit_non_chat_method() {
+        let event = LiveEvent {
+            ts: 1,
+            platform: "douyin".to_string(),
+            room_id: "123".to_string(),
+            event_type: "danmu".to_string(),
+            data: json!({
+                "method": "WebcastGiftMessage",
+                "content": "not a chat"
+            }),
+            raw: Value::Null,
+        };
+        let persisted = serde_json::to_string(&event).unwrap();
+
+        assert!(export_persisted_danmu_line(&persisted, "douyin", "123")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn persisted_non_douyin_export_keeps_its_existing_full_format() {
+        let event = LiveEvent {
+            ts: 1234,
+            platform: "bilibili".to_string(),
+            room_id: "123".to_string(),
+            event_type: "danmu".to_string(),
+            data: json!({ "content": "其他平台弹幕" }),
+            raw: json!({
+                "id": "message-id",
+                "content": "其他平台弹幕"
+            }),
+        };
+        let persisted = serde_json::to_string(&event).unwrap();
+
+        let output = export_persisted_danmu_line(&persisted, "bilibili", "123")
+            .unwrap()
+            .unwrap();
+        let exported: Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(exported, event.raw);
     }
 
     #[test]

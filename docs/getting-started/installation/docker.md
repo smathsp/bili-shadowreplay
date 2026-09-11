@@ -33,7 +33,7 @@ ghcr.io/smathsp/bili-shadowreplay:latest
 如需固定版本，可在启动前设置 `BILI_SHADOWREPLAY_IMAGE`，例如：
 
 ```bash
-export BILI_SHADOWREPLAY_IMAGE=ghcr.io/smathsp/bili-shadowreplay:2.22.4
+export BILI_SHADOWREPLAY_IMAGE=ghcr.io/smathsp/bili-shadowreplay:2.22.5
 docker compose -f docker_compose.yaml up -d
 ```
 
@@ -53,6 +53,16 @@ Compose 会在当前目录创建并持久保存以下目录：
 Web 设置页可以修改缓存和输出路径。容器会立即使用新路径；若希望重建容器后仍
 保留内容，请确保新路径也位于已映射的 `/app/data`、`/app/cache`、`/app/output`
 或 `/app/models` 中。
+
+## 抖音弹幕导出
+
+Web 界面的“导出弹幕资料为 JSONL”会逐行导出抖音聊天消息，每行严格只包含
+`displayId`、`name`、`avatar`、`content` 四个字段。旧录像也会按这个精简格式
+导出；内部录制文件仍保留原始数据，用于断线恢复、去重和后续兼容。
+
+```json
+{"displayId":"bgz_1","name":"114514研究所—白教授","avatar":"https://example.com/avatar.jpeg","content":"弹幕内容"}
+```
 
 ## 局域网访问
 

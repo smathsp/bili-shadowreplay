@@ -903,8 +903,15 @@ mod tests {
         assert_eq!(event.raw["method"], "WebcastChatMessage");
         assert_eq!(event.raw["user"]["id"], "MS4w.test");
         assert_eq!(event.raw["user"]["shortId"], "2988955578");
+        assert_eq!(event.raw["user"]["displayId"], "dyr8cty6m73n");
+        assert_eq!(event.raw["user"]["name"], "枯枝邀明月");
+        assert_eq!(
+            event.raw["user"]["avatar"],
+            "https://example.com/avatar.jpeg"
+        );
         assert_eq!(event.raw["user"]["fansClub"][0]["level"], 9);
         assert_eq!(event.raw["user"]["currentTargetAnchorId"], "105460512869");
+        assert_eq!(event.raw["content"], "终于能播了");
         assert_eq!(event.raw["payloadHex"], "0102");
     }
 

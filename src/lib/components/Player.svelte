@@ -1442,7 +1442,7 @@ ${mediaPlaylistUrl}`;
     };
     const file_name = `danmu_${room_id}_${live_id}.${format}`;
 
-    // Let the browser stream complete JSONL straight to its download manager.
+    // Let the browser stream JSONL straight to its download manager.
     // Going through invoke would wrap the whole file in JSON and keep multiple
     // copies of long-live danmu records in both server and browser memory.
     if (!TAURI_ENV && format === "jsonl") {
@@ -1455,7 +1455,7 @@ ${mediaPlaylistUrl}`;
       const preflight = await fetch(downloadUrl, { method: "HEAD" });
       if (!preflight.ok) {
         const message = preflight.statusText || `HTTP ${preflight.status}`;
-        throw new Error(`完整弹幕下载不可用：${message}`);
+        throw new Error(`弹幕资料下载不可用：${message}`);
       }
       const a = document.createElement("a");
       a.href = downloadUrl;
@@ -1472,7 +1472,7 @@ ${mediaPlaylistUrl}`;
     const content = (await invoke("export_danmu", { options })) as string;
     if (TAURI_ENV) {
       const path = await save({
-        title: format === "jsonl" ? "导出完整弹幕" : "导出弹幕",
+        title: format === "jsonl" ? "导出弹幕资料" : "导出弹幕",
         defaultPath: file_name,
       });
       if (!path) return;

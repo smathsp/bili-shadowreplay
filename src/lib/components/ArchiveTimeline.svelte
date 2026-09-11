@@ -417,10 +417,10 @@
             <button
               type="button"
               class="menu-item"
-              title="包含消息 ID、用户资料、平台原始字段等信息"
+              title="以 JSONL 格式导出弹幕资料"
               onclick={() => onExportDanmu?.("jsonl")}
             >
-              导出完整弹幕为 JSONL
+              导出弹幕资料为 JSONL
             </button>
             <div class="menu-divider"></div>
             <span class="menu-heading">快捷跳转</span>

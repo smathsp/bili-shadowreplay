@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: "Optional Docker-only release version (for example 2.22.4)"
+        description: "Optional Docker-only release version (for example 2.22.5)"
         required: false
         type: string
   push:
@@ -70,7 +70,7 @@ jobs:
           if [[ -n "$DOCKER_RELEASE_VERSION" ]] &&
              [[ ! "$DOCKER_RELEASE_VERSION" =~ $semver_regex ]]; then
             echo "Invalid Docker release version: $DOCKER_RELEASE_VERSION" >&2
-            echo "Use a semantic version such as 2.22.4 or 2.22.4-rc.1." >&2
+            echo "Use a semantic version such as 2.22.5 or 2.22.5-rc.1." >&2
             exit 1
           fi
 
@@ -78,7 +78,7 @@ jobs:
             tag_version=${GITHUB_REF_NAME#v}
             if [[ "$GITHUB_REF_NAME" != v* ]] || [[ ! "$tag_version" =~ $semver_regex ]]; then
               echo "Invalid Docker release tag: $GITHUB_REF_NAME" >&2
-              echo "Use a semantic version tag such as v2.22.4 or v2.22.4-rc.1." >&2
+              echo "Use a semantic version tag such as v2.22.5 or v2.22.5-rc.1." >&2
               exit 1
             fi
 

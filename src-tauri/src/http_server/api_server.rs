@@ -2685,7 +2685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn danmu_file_response_streams_flattened_douyin_jsonl() {
+    async fn danmu_file_response_streams_compact_douyin_jsonl() {
         let directory = TestDirectory::new();
         let events_path = directory.0.join("events.jsonl");
         let chat = danmu_stream::LiveEvent {
@@ -2699,7 +2699,9 @@ mod tests {
                 "method": "WebcastChatMessage",
                 "user": {
                     "id": "MS4w.test",
+                    "displayId": "dyr8cty6m73n",
                     "name": "枯枝邀明月",
+                    "avatar": "https://example.com/avatar.jpeg",
                     "fansClub": [{ "anchorId": "105460512869", "level": 9 }]
                 },
                 "content": "终于能播了",
@@ -2751,8 +2753,16 @@ mod tests {
 
         assert_eq!(lines.len(), 1);
         let exported: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(exported, chat.raw);
-        assert!(exported.get("raw").is_none());
+        assert_eq!(
+            exported,
+            serde_json::json!({
+                "displayId": "dyr8cty6m73n",
+                "name": "枯枝邀明月",
+                "avatar": "https://example.com/avatar.jpeg",
+                "content": "终于能播了"
+            })
+        );
+        assert_eq!(exported.as_object().unwrap().len(), 4);
     }
 
     #[tokio::test]

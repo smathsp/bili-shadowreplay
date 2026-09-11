@@ -169,7 +169,7 @@ test("headless-only API dependencies and live notifications are wired", () => {
   assert.match(recorderHandlerSource, /local_offset:\s*f64/);
 });
 
-test("Docker streams complete Douyin danmu without JSON response buffering", () => {
+test("Docker streams compact Douyin danmu without JSON response buffering", () => {
   assert.match(
     apiSource,
     /route\("\/api\/export_danmu_file",\s*get\(handler_export_danmu_file\)\)/,
@@ -177,8 +177,11 @@ test("Docker streams complete Douyin danmu without JSON response buffering", () 
   assert.match(apiSource, /Body::from_stream\(stream\)/);
   assert.match(
     recorderHandlerSource,
-    /Docker 完整弹幕请使用流式 GET \/api\/export_danmu_file/,
+    /Docker 弹幕资料请使用流式 GET \/api\/export_danmu_file/,
   );
+  assert.match(recorderHandlerSource, /struct DouyinDanmuExportEntry/);
+  assert.match(recorderHandlerSource, /display_id:\s*&'a str/);
+  assert.match(recorderHandlerSource, /export_compact_douyin_danmu_event/);
   assert.match(playerSource, /format === "jsonl"/);
   assert.match(playerSource, /\/api\/export_danmu_file\?/);
   assert.match(playerSource, /method: "HEAD"/);
