@@ -132,7 +132,7 @@ let STATIC_PORT = 0;
 let config: Config | null = null;
 
 async function get_static_url(base: string, path: string) {
-  if (config === null) {
+  if (TAURI_ENV && config === null) {
     config = (await invoke("get_config")) as any;
   }
   let staticUrl;

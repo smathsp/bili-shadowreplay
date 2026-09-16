@@ -39,6 +39,14 @@ const playerSource = await readFile(
   new URL("../../src/lib/components/Player.svelte", import.meta.url),
   "utf8",
 );
+const wholeClipModalSource = await readFile(
+  new URL("../../src/lib/components/GenerateWholeClipModal.svelte", import.meta.url),
+  "utf8",
+);
+const invokerSource = await readFile(
+  new URL("../../src/lib/invoker.ts", import.meta.url),
+  "utf8",
+);
 const douyinProviderSource = await readFile(
   new URL(
     "../../src-tauri/crates/danmu_stream/src/provider/douyin.rs",
@@ -148,6 +156,21 @@ test("Docker settings remain visible with a same-origin endpoint", () => {
   assert.doesNotMatch(settingSource, /TAURI_ENV\s*\|\|\s*endpoint\s*!==?\s*["']{2}/);
   assert.match(settingSource, /updateContainerCachePath/);
   assert.match(settingSource, /updateContainerOutputPath/);
+});
+
+test("whole-clip modal statically guards against reload loops and stale requests", () => {
+  const loadingEffect = wholeClipModalSource.match(
+    /\$effect\(\(\) => \{\s*if \(showModal && archive\) \{[\s\S]*?\n  \}\);/,
+  )?.[0];
+  assert.ok(loadingEffect, "the modal must load archives when it opens");
+  assert.match(loadingEffect, /untrack\(\(\) => void loadWholeClipArchives\(/);
+  assert.doesNotMatch(loadingEffect, /\bisLoading\s*\)/);
+  assert.match(wholeClipModalSource, /withTimeout\([\s\S]*?"get_archives_by_parent_id"/);
+  assert.match(wholeClipModalSource, /if \(!isCurrentLoad\(version\)\) return/);
+  assert.match(wholeClipModalSource, /if \(isCurrentLoad\(version\)\) isLoading = false/);
+  assert.match(wholeClipModalSource, /\{:else if loadError\}[\s\S]*?onclick=\{retryLoad\}/);
+  assert.match(wholeClipModalSource, /\/\/ 封面是可选信息，不应让片段列表继续停在“加载中”/);
+  assert.match(invokerSource, /if \(TAURI_ENV && config === null\)/);
 });
 
 test("headless-only API dependencies and live notifications are wired", () => {

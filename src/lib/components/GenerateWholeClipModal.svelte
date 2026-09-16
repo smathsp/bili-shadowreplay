@@ -3,7 +3,7 @@
   import type { RecordItem } from "../db";
   import { fade, scale } from "svelte/transition";
   import { X, FileVideo, Info } from "lucide-svelte";
-  import { onMount } from "svelte";
+  import { untrack } from "svelte";
   import { clickOutside } from "../actions/clickOutside";
 
   interface Props {
@@ -22,26 +22,42 @@
   let selectedLiveIds: string[] = $state([]);
   let outputName = $state("");
   let showSelectionHelp = $state(false);
+  let loadError = $state("");
+  let loadVersion = 0;
 
+  function isCurrentLoad(version: number) {
+    return showModal && version === loadVersion;
+  }
 
-  async function loadWholeClipArchives(roomId: string, parentId: string) {
-    if (isLoading) return;
+  function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+    let timeout: ReturnType<typeof setTimeout>;
+    return Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("请求超时，请检查 Docker 服务后重试")),
+          timeoutMs
+        );
+      }),
+    ]).finally(() => clearTimeout(timeout));
+  }
 
+  async function loadWholeClipArchives(roomId: string, parentId: string, version: number) {
     isLoading = true;
+    loadError = "";
+    wholeClipArchives = [];
+    selectedLiveIds = [];
     try {
       // 获取与当前archive具有相同parent_id的所有archives
-      let sameParentArchives = (await invoke("get_archives_by_parent_id", {
-        roomId: roomId,
-        parentId: parentId,
-      })) as RecordItem[];
+      let sameParentArchives = await withTimeout(
+        invoke<RecordItem[]>("get_archives_by_parent_id", {
+          roomId: roomId,
+          parentId: parentId,
+        }),
+        15000
+      );
 
-      // 处理封面
-      for (const archive of sameParentArchives) {
-        archive.cover = await get_static_url(
-          "cache",
-          `${archive.platform}/${archive.room_id}/${archive.live_id}/cover.jpg`
-        );
-      }
+      if (!isCurrentLoad(version)) return;
 
       // 按时间排序
       sameParentArchives.sort((a, b) => {
@@ -53,12 +69,41 @@
       wholeClipArchives = sameParentArchives;
       selectedLiveIds = sameParentArchives.map((item) => item.live_id);
       outputName = buildDefaultOutputName();
+
+      // 封面是可选信息，不应让片段列表继续停在“加载中”。
+      void Promise.all(
+        sameParentArchives.map(async (item) => {
+          try {
+            const cover = await withTimeout(
+              get_static_url(
+                "cache",
+                `${item.platform}/${item.room_id}/${item.live_id}/cover.jpg`
+              ),
+              5000
+            );
+            return { ...item, cover };
+          } catch (error) {
+            console.warn("Failed to load whole clip cover:", error);
+            return item;
+          }
+        })
+      ).then((archives) => {
+        if (isCurrentLoad(version)) wholeClipArchives = archives;
+      });
     } catch (error) {
       console.error("Failed to load whole clip archives:", error);
-      wholeClipArchives = [];
+      if (isCurrentLoad(version)) {
+        wholeClipArchives = [];
+        loadError = error instanceof Error ? error.message : String(error);
+      }
     } finally {
-      isLoading = false;
+      if (isCurrentLoad(version)) isLoading = false;
     }
+  }
+
+  function retryLoad() {
+    if (!archive) return;
+    void loadWholeClipArchives(roomId, archive.parent_id, ++loadVersion);
   }
 
   async function generateWholeClip() {
@@ -163,7 +208,10 @@
 
 
   function closeModal() {
+    ++loadVersion;
     showModal = false;
+    isLoading = false;
+    loadError = "";
     wholeClipArchives = [];
     selectedLiveIds = [];
     outputName = "";
@@ -172,7 +220,14 @@
   // 当modal显示且有archive时，加载相关片段
   $effect(() => {
     if (showModal && archive) {
-      loadWholeClipArchives(roomId, archive.parent_id);
+      const currentRoomId = roomId;
+      const currentParentId = archive.parent_id;
+      const version = ++loadVersion;
+      // 不让加载函数同步读取的 isLoading 变成此 effect 的依赖。
+      untrack(() => void loadWholeClipArchives(currentRoomId, currentParentId, version));
+      return () => {
+        if (loadVersion === version) ++loadVersion;
+      };
     }
   });
   let selectedArchives = $derived(selectedLiveIds
@@ -238,6 +293,16 @@
                   ></div>
                   <span>加载中...</span>
                 </div>
+              </div>
+            {:else if loadError}
+              <div class="text-center py-8 text-sm text-red-600 dark:text-red-400">
+                <p>片段加载失败：{loadError}</p>
+                <button
+                  class="mt-3 text-blue-600 hover:text-blue-700 dark:text-blue-400"
+                  onclick={retryLoad}
+                >
+                  重试
+                </button>
               </div>
             {:else if wholeClipArchives.length === 0}
               <div class="text-center py-8 text-gray-500 dark:text-gray-400">
